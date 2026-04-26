@@ -7,59 +7,116 @@ on:
 permissions:
   contents: write
 
+env:
+  IMAGE_NAME: gosh-memory
+
 jobs:
   build:
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            suffix: amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            suffix: arm64
+            runner: ubuntu-latest
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and export
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          ARTIFACT="${IMAGE_NAME}-v${VERSION}-${{ matrix.suffix }}.tar"
+
+          docker buildx build \
+            --platform ${{ matrix.platform }} \
+            -f docker/Dockerfile \
+            -t "${IMAGE_NAME}:${VERSION}" \
+            -t "${IMAGE_NAME}:latest" \
+            --output "type=docker,dest=${ARTIFACT}" \
+            .
+
+          sha256sum "${ARTIFACT}" > "${ARTIFACT}.sha256"
+          echo "ARTIFACT=${ARTIFACT}" >> "$GITHUB_ENV"
+          echo "CHECKSUM_FILE=${ARTIFACT}.sha256" >> "$GITHUB_ENV"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.suffix }}
+          path: |
+            ${{ env.ARTIFACT }}
+            ${{ env.CHECKSUM_FILE }}
+
+  release:
+    needs: build
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
         with:
-          python-version: "3.10"
+          path: artifacts
+          merge-multiple: true
 
-      - name: Build Python package artifacts
+      - name: Generate manifest.json
         run: |
-          python -m pip install --upgrade pip build
-          python -m build --sdist --wheel
+          VERSION="${GITHUB_REF_NAME#v}"
 
-      - name: Generate artifact manifest
-        run: |
-          python - <<'PY'
-          import hashlib
-          import json
-          import re
-          from pathlib import Path
+          # Collect checksums
+          declare -A CHECKSUMS
+          declare -A ARCHIVES
+          for sha_file in artifacts/*.sha256; do
+            hash=$(awk '{print $1}' "$sha_file")
+            archive=$(awk '{print $2}' "$sha_file")
+            # Extract suffix: gosh-memory-v0.1.0-amd64.tar → amd64
+            suffix=$(echo "$archive" | sed -E 's/.*-([^-]+)\.tar$/\1/')
+            CHECKSUMS["$suffix"]="$hash"
+            ARCHIVES["$suffix"]="$archive"
+          done
 
-          pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
-          match = re.search(r'(?m)^version\s*=\s*"([^"]+)"\s*$', pyproject)
-          if not match:
-              raise SystemExit("FATAL: could not read project version")
-          version = match.group(1)
-
-          artifacts = {}
-          for path in sorted(Path("dist").iterdir()):
-              if path.name == "manifest.json" or path.suffix == ".sha256":
-                  continue
-              digest = hashlib.sha256(path.read_bytes()).hexdigest()
-              sha_path = path.with_name(f"{path.name}.sha256")
-              sha_path.write_text(f"{digest}  {path.name}\n", encoding="utf-8")
-              artifacts[path.name] = {"sha256": digest}
-
-          manifest = {
-              "version": version,
-              "format_version": 1,
-              "artifacts": artifacts,
+          cat > artifacts/manifest.json <<MANIFEST
+          {
+            "version": "${VERSION}",
+            "format_version": 1,
+            "artifacts": {
+              "amd64": {
+                "sha256": "${CHECKSUMS[amd64]}",
+                "archive": "${ARCHIVES[amd64]}"
+              },
+              "arm64": {
+                "sha256": "${CHECKSUMS[arm64]}",
+                "archive": "${ARCHIVES[arm64]}"
+              }
+            }
           }
-          Path("dist/manifest.json").write_text(
-              json.dumps(manifest, indent=2, sort_keys=True) + "\n",
-              encoding="utf-8",
-          )
-          PY
+          MANIFEST
 
-      - name: Upload release assets
+          python3 -m json.tool artifacts/manifest.json > artifacts/manifest_pretty.json \
+            && mv artifacts/manifest_pretty.json artifacts/manifest.json
+
+          echo "Generated manifest.json:"
+          cat artifacts/manifest.json
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           files: |
-            dist/*
+            artifacts/*
