@@ -10,11 +10,15 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import json
 from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = PROJECT_ROOT / "ci" / "mirror" / "materialize_internal_ci.py"
+PUBLIC_HARNESS_PATH = PROJECT_ROOT / "ci" / "mirror" / "run_public_harness.sh"
+MIRROR_SCRIPT_PATH = PROJECT_ROOT / "ci" / "mirror" / "mirror.sh"
+MIRROR_CONFIG_PATH = PROJECT_ROOT / "ci" / "mirror" / "mirror_config.json"
 
 
 def test_materialize_internal_ci_uses_current_ci_layout(tmp_path: Path) -> None:
@@ -40,3 +44,36 @@ def test_materialize_internal_ci_uses_current_ci_layout(tmp_path: Path) -> None:
     assert "scripts/mirror/" not in rendered
     assert "ci/scripts/" in rendered
     assert "ci/mirror/" in rendered
+
+
+def test_public_harness_uses_current_packaging_and_e2e_paths() -> None:
+    script = PUBLIC_HARNESS_PATH.read_text(encoding="utf-8")
+
+    assert "requirements.txt" not in script
+    assert "test_live_runtime_e2e.py" not in script
+    assert "test_mal_ama_live.py" not in script
+    assert "pytest" not in script
+    assert "cargo build" not in script
+    assert 'python3 -m pip install -e "$MEMORY_REPO"' in script
+    assert 'python3 -m compileall -q "$MEMORY_REPO/src"' in script
+    assert 'importlib.import_module("src.cli")' in script
+    assert 'importlib.import_module("src.mcp_server")' in script
+    assert 'manifest = repo / "Cargo.toml"' in script
+    assert "public harness packaging smoke passed" in script
+
+
+def test_startrek_release_stage_excludes_memory_docs_and_preserves_public_readme() -> None:
+    config = json.loads(MIRROR_CONFIG_PATH.read_text(encoding="utf-8"))
+    startrek = config["repos"]["gosh.startrek"]
+    script = MIRROR_SCRIPT_PATH.read_text(encoding="utf-8")
+    workflow = (PROJECT_ROOT / ".github" / "workflows" / "mirror.yml").read_text(encoding="utf-8")
+
+    assert "docs/" not in startrek["include"]
+    assert "docs/" in startrek["exclude"]
+    assert 'SOURCE_DIR="$(cd "$SOURCE_DIR" && pwd)"' in script
+    assert 'rm -rf "$STAGE_DIR/docs"' in script
+    assert "startrek stage must not include gosh.memory docs" in script
+    assert "STARTREK_README_BACKUP" in script
+    assert 'find "$STARTREK_README_BACKUP" -maxdepth 1 -type f -iname "README*"' in script
+    assert "latest release already points at source" in workflow
+    assert "No docs changes to publish" in workflow
