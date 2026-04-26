@@ -1,0 +1,174 @@
+# Copyright (c) 2026 GOSH Operating Co., GOSH Technology Ltd., and Mitja Goroshevsky
+# SPDX-License-Identifier: LicenseRef-GOSH-Noncommercial-1.0
+#
+# Licensed under the GOSH.AI Noncommercial License, Version 1.0.
+# See LICENSE.md in the root of this repository for the full license
+# text. Use of this file for any Commercial Purpose requires a separate
+# written license. Contact: legal@gosh.sh
+
+x-runtime-base: &runtime-base
+  image: ${LIVE_E2E_RUNTIME_TAG}
+  build:
+    context: ${LIVE_E2E_BUILD_CONTEXT}/tests/live.e2e
+    dockerfile: Dockerfile.runtime
+
+services:
+  memory:
+    image: ${LIVE_E2E_MEMORY_TAG}
+    build:
+      context: ${LIVE_E2E_BUILD_CONTEXT}
+      dockerfile: tests/live.e2e/Dockerfile.memory
+    hostname: memory
+    working_dir: ${MEMORY_WORKTREE}
+    environment:
+      GOSH_MEMORY_TOKEN: ${LIVE_E2E_SERVER_TOKEN}
+      GOSH_MEMORY_ADMIN_TOKEN: ${LIVE_E2E_ADMIN_TOKEN}
+      GOSH_MEMORY_ENCRYPTION_KEY: ${LIVE_E2E_MEMORY_ENCRYPTION_KEY}
+      HOME: /home/memory
+      USER: memory
+      HF_HOME: /home/memory/.cache/huggingface
+      PYTHONUNBUFFERED: "1"
+    command:
+      - bash
+      - -lc
+      - >-
+        exec /opt/memory-venv/bin/python -m src.cli start
+        --host 0.0.0.0
+        --port 8765
+        --data-dir /data
+        --server-token "$${GOSH_MEMORY_TOKEN}"
+    volumes:
+      - type: bind
+        source: ${MEMORY_WORKTREE}
+        target: ${MEMORY_WORKTREE}
+        read_only: true
+      - type: bind
+        source: ${MEMORY_HOME_DIR}
+        target: /home/memory
+      - type: bind
+        source: ${ARTIFACTS_DIR}
+        target: /artifacts
+      - type: volume
+        source: memory-data
+        target: /data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8765/health >/dev/null || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+    networks:
+      - live
+
+  operator:
+    <<: *runtime-base
+    hostname: operator
+    working_dir: /workspace
+    environment:
+      HOME: /home/operator
+      USER: operator
+      TMPDIR: /tmp
+      PATH: /opt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    command: ["sleep", "infinity"]
+    volumes:
+      - type: bind
+        source: ${CLI_BINARY_HOST}
+        target: /opt/bin/gosh
+        read_only: true
+      - type: bind
+        source: ${AGENT_BINARY_HOST}
+        target: /opt/bin/gosh-agent
+        read_only: true
+      - type: bind
+        source: ${ARTIFACTS_DIR}
+        target: /artifacts
+      - type: bind
+        source: ${OPERATOR_HOME_DIR}
+        target: /home/operator
+      - type: bind
+        source: ${LIVE_E2E_BUILD_CONTEXT}
+        target: /workspace
+        read_only: true
+    depends_on:
+      memory:
+        condition: service_healthy
+    networks:
+      - live
+
+  agent-a:
+    <<: *runtime-base
+    hostname: agent-a
+    working_dir: /workspace
+    environment:
+      HOME: /home/agent
+      USER: agent
+      PATH: /opt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      GOSH_AGENT_BIN: /opt/bin/gosh-agent
+      AGENT_BOOTSTRAP_FILE: /bootstrap/agent-a-bootstrap.json
+      AGENT_PORT: "8767"
+      AGENT_HOST: 0.0.0.0
+      WATCH_KEY: ${LIVE_E2E_WORK_KEY_AGENT_A}
+      WATCH_CONTEXT_KEY: ${LIVE_E2E_CONTEXT_KEY}
+      WATCH_SWARM_ID: ${LIVE_E2E_SWARM_ID}
+    command: ["/opt/live.e2e/start-agent.sh"]
+    volumes:
+      - type: bind
+        source: ${AGENT_BINARY_HOST}
+        target: /opt/bin/gosh-agent
+        read_only: true
+      - type: bind
+        source: ${ARTIFACTS_DIR}
+        target: /artifacts
+      - type: bind
+        source: ${AGENT_A_HOME_DIR}
+        target: /home/agent
+      - type: bind
+        source: ${AGENT_A_BOOTSTRAP_DIR}
+        target: /bootstrap
+    depends_on:
+      memory:
+        condition: service_healthy
+    networks:
+      - live
+
+  agent-b:
+    <<: *runtime-base
+    hostname: agent-b
+    working_dir: /workspace
+    environment:
+      HOME: /home/agent
+      USER: agent
+      PATH: /opt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      GOSH_AGENT_BIN: /opt/bin/gosh-agent
+      AGENT_BOOTSTRAP_FILE: /bootstrap/agent-b-bootstrap.json
+      AGENT_PORT: "8768"
+      AGENT_HOST: 0.0.0.0
+      WATCH_KEY: ${LIVE_E2E_WORK_KEY_AGENT_B}
+      WATCH_CONTEXT_KEY: ${LIVE_E2E_CONTEXT_KEY}
+      WATCH_SWARM_ID: ${LIVE_E2E_SWARM_ID}
+    command: ["/opt/live.e2e/start-agent.sh"]
+    volumes:
+      - type: bind
+        source: ${AGENT_BINARY_HOST}
+        target: /opt/bin/gosh-agent
+        read_only: true
+      - type: bind
+        source: ${ARTIFACTS_DIR}
+        target: /artifacts
+      - type: bind
+        source: ${AGENT_B_HOME_DIR}
+        target: /home/agent
+      - type: bind
+        source: ${AGENT_B_BOOTSTRAP_DIR}
+        target: /bootstrap
+    depends_on:
+      memory:
+        condition: service_healthy
+    networks:
+      - live
+
+volumes:
+  memory-data:
+
+networks:
+  live:
+    driver: bridge

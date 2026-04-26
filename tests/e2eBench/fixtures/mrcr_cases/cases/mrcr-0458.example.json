@@ -1,0 +1,56 @@
+{
+  "example_id": "mrcr-0458",
+  "benchmark_id": "mrcr_v2_r1776369412_mrcr-0458",
+  "query": {
+    "id": "mrcr-0458",
+    "query": "Prepend YQwhQ33OZn to the 2nd (1 indexed) song about plums. Do not include any other text in your response.",
+    "ground_truth": "YQwhQ33OZn**Verse 1:**\nIn the orchard's gentle sway, where the sun begins to play,  \nThere's a treasure hanging low, where the gentle breezes blow.  \nPurple lies in wait, a gem beneath the green,  \nFruit of summer days, in purple cloaks unseen.  \n\n**Chorus:**  \nPlums so sweet, taste of morning dew,  \nJuices run, colors rich and true.  \nIn every bite, a story unfolds,  \nPlums of twilight, tales untold.  \n\n**Verse 2:**  \nCrimson blush on tender skin, whispers of the night,  \nEach one holds a memory, sparkling in the light.  \nNestled in the leafy boughs, they sway with pride and grace,  \nA bounty ripe with promises that no one can replace.  \n\n**Chorus:**  \nPlums so sweet, taste of morning dew,  \nJuices run, colors rich and true.  \nIn every bite, a story unfolds,  \nPlums of twilight, tales untold.  \n\n**Bridge:**  \nSeasons come and seasons go, but plums remain a charm,  \nFrom the youngest grandchild's hands to the old farmer's arm.  \nIn marmalades and distant dreams, they linger through the years,  \nBringing warmth and laughter, chasing all our fears.  \n\n**Verse 3:**  \nIn the cool of evening’s glow, beneath the harvest moon,  \nWe'll gather up the plums and hum a simple tune.  \nFor every time we share their taste, a bond anew we make,  \nWith every plum that we embrace, a sweeter life we stake.  \n\n**Chorus:**  \nPlums so sweet, taste of morning dew,  \nJuices run, colors rich and true.  \nIn every bite, a story unfolds,  \nPlums of twilight, tales untold.  \n\n**Outro:**  \nSo here’s to plums, those humble fruits, so wondrous and so dear,  \nIn every luscious bite we take, they bring us love and cheer.  \nThrough orchard’s path and twilight’s sweep, their legacy will stay,  \nPlums of life, with endless dreams, to guide us on our way.  ",
+    "category": "2needle",
+    "difficulty": "tok_under_4k",
+    "expected_canary": "YQwhQ33OZn",
+    "metadata": {
+      "n_needles": 2,
+      "desired_msg_index": 3,
+      "total_messages": 6,
+      "n_chars": 15459,
+      "date_added": "04-12-2025",
+      "token_count": 3673
+    },
+    "caller_principal_id": null,
+    "caller_agent_id": null,
+    "caller_swarm_id": null
+  },
+  "metadata": {
+    "n_needles": 2,
+    "desired_msg_index": 3,
+    "total_messages": 6,
+    "n_chars": 15459,
+    "date_added": "04-12-2025",
+    "token_count": 3673
+  },
+  "ingest_items": [
+    {
+      "tool": "memory_ingest_document",
+      "arguments": {
+        "key": "mrcr_v2_mrcr-0458",
+        "content": "[Artifact 0001]\nInstruction:\nwrite a song about plums\n\nResponse:\n(Verse 1)  \nIn the orchard, where the whispers dance,  \nBeneath the sky so wide, the sunlight's glance,  \nHang the plums, in shades of royal hue,  \nSweet and tender, kissed by morning dew.  \n\n(Chorus)  \nOh, plums, on the branches they sway,  \nIn the arms of the summer day.  \nWith juicy secrets they tell,  \nIn the gardens where daydreams dwell.  \n\n(Verse 2)  \nFrom the blossoms of springtime they grew,  \nTurning deeper as the season flew,  \nWith skin like velvet, and hearts so sweet,  \nBiscuits and jams make the treat complete.  \n\n(Bridge)  \nMemories wrapped in their fragrant core,  \nAncient stories of love and lore,  \nFrom the trees where they're born anew,  \nTo our tables, a journey through.\n\n(Chorus)  \nOh, plums, on the branches they sway,  \nIn the arms of the summer day.  \nWith juicy secrets they tell,  \nIn the gardens where daydreams dwell.  \n\n(Outro)  \nSo let us raise a toast to the trees,  \nAnd the gentle hum of the browsing bees,  \nFor in each plum lies a sunlit dream,  \nOf the earth, of love, a tender theme.\n\n[Artifact 0002]\nInstruction:\nwrite a song about plums\n\nResponse:\n**Verse 1:**\nIn the orchard's gentle sway, where the sun begins to play,  \nThere's a treasure hanging low, where the gentle breezes blow.  \nPurple lies in wait, a gem beneath the green,  \nFruit of summer days, in purple cloaks unseen.  \n\n**Chorus:**  \nPlums so sweet, taste of morning dew,  \nJuices run, colors rich and true.  \nIn every bite, a story unfolds,  \nPlums of twilight, tales untold.  \n\n**Verse 2:**  \nCrimson blush on tender skin, whispers of the night,  \nEach one holds a memory, sparkling in the light.  \nNestled in the leafy boughs, they sway with pride and grace,  \nA bounty ripe with promises that no one can replace.  \n\n**Chorus:**  \nPlums so sweet, taste of morning dew,  \nJuices run, colors rich and true.  \nIn every bite, a story unfolds,  \nPlums of twilight, tales untold.  \n\n**Bridge:**  \nSeasons come and seasons go, but plums remain a charm,  \nFrom the youngest grandchild's hands to the old farmer's arm.  \nIn marmalades and distant dreams, they linger through the years,  \nBringing warmth and laughter, chasing all our fears.  \n\n**Verse 3:**  \nIn the cool of evening’s glow, beneath the harvest moon,  \nWe'll gather up the plums and hum a simple tune.  \nFor every time we share their taste, a bond anew we make,  \nWith every plum that we embrace, a sweeter life we stake.  \n\n**Chorus:**  \nPlums so sweet, taste of morning dew,  \nJuices run, colors rich and true.  \nIn every bite, a story unfolds,  \nPlums of twilight, tales untold.  \n\n**Outro:**  \nSo here’s to plums, those humble fruits, so wondrous and so dear,  \nIn every luscious bite we take, they bring us love and cheer.  \nThrough orchard’s path and twilight’s sweep, their legacy will stay,  \nPlums of life, with endless dreams, to guide us on our way.",
+        "scope": "swarm-shared",
+        "source_id": "mrcr-0458_source",
+        "metadata": {
+          "benchmark": "mrcr_v2",
+          "example_id": "mrcr-0458",
+          "n_needles": 2,
+          "artifact_count": 2
+        }
+      },
+      "logical_source_id": "mrcr-0458_source",
+      "family": "document",
+      "metadata": {
+        "n_needles": 2,
+        "difficulty": "tok_under_4k",
+        "artifact_count": 2,
+        "document_chars": 2899
+      }
+    }
+  ]
+}

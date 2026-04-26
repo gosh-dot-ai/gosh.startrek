@@ -1,0 +1,19 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bash \
+        ca-certificates \
+        curl \
+        jq \
+        procps \
+        tini \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY start-agent.sh /opt/live.e2e/start-agent.sh
+RUN chmod +x /opt/live.e2e/start-agent.sh
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["sleep", "infinity"]

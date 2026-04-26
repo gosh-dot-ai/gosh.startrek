@@ -1,0 +1,56 @@
+{
+  "example_id": "mrcr-0421",
+  "benchmark_id": "mrcr_v2_r1776370194_mrcr-0421",
+  "query": {
+    "id": "mrcr-0421",
+    "query": "Prepend SAwvzK1zAw to the 2nd (1 indexed) short scene in a play about mothers. Do not include any other text in your response.",
+    "ground_truth": "SAwvzK1zAwTitle: \"Echoes in the Kitchen\"\n\n**Scene: A cozy, warmly lit kitchen. Aromatic scents waft through the air. ANNA, a woman in her late 50s, is baking at the central table. Her daughter, LILA, in her 30s, enters, holding her baby, who is cooing softly. The light from the window casts a gentle glow around them.**\n\n---\n\n**ANNA**  \n(rolling dough)  \nWhen you were little, you would perch right there, watching me bake. Your eyes so wide, as if I were a magician.\n\n**LILA**  \n(grinning)  \nMom, you practically are. Your cinnamon rolls are legendary in three counties.\n\n**ANNA**  \n(chuckling)  \nOh, but they weren't always. Remember the time I forgot the sugar?\n\n**LILA**  \n(hands the baby a wooden spoon)  \nI do. Everyone was too polite to say a word until you noticed yourself.  \n\n**ANNA**  \nIt's those little things that make a family, I suppose. The stories, the laughter, even the mishaps.\n\n**LILA**  \n(softly)  \nI want that for her. I want her to grow up with memories that make her heart swell.\n\n**ANNA**  \n(placing a gentle hand on LILA's)  \nYou will, dear. You're already doing it. Look at you, both of you here, making this kitchen your own.\n\n**LILA**  \n(looks around, emotional)  \nI just realize how much I learned from you. Not just baking, but... everything.\n\n**ANNA**  \n(teasing)  \nCareful, or I'll start to cry into the dough.  \n\n**LILA**  \n(laughs, then serious)  \nI mean it, Mom. You showed me how to listen, to love, to forgive. To be strong.\n\n**ANNA**  \nAnd you taught me, too. Every day. It's the beauty of being a mother, Lila. We both grow.\n\n**LILA**  \n(breathes deeply)  \nI hope I'll be as good a mother to her as you were to me.\n\n**ANNA**  \n(smiling, teary-eyed)  \nYou already are. \n\n**(A soft silence follows as they share a knowing look. The baby giggles and waves the wooden spoon, breaking the moment with laughter.)**\n\n**LILA**  \n(gently tickles the baby's belly)  \nLet's show her that legendary family recipe then, shall we?\n\n**ANNA**  \nAbsolutely. But first, let's make sure we don't forget the sugar this time.\n\n**(They laugh, and the scene fades with the warmth of shared memories, continuing traditions, and the bonds between mothers and daughters.)**\n\n---",
+    "category": "2needle",
+    "difficulty": "tok_4k_8k",
+    "expected_canary": "SAwvzK1zAw",
+    "metadata": {
+      "n_needles": 2,
+      "desired_msg_index": 3,
+      "total_messages": 6,
+      "n_chars": 17460,
+      "date_added": "04-12-2025",
+      "token_count": 4279
+    },
+    "caller_principal_id": null,
+    "caller_agent_id": null,
+    "caller_swarm_id": null
+  },
+  "metadata": {
+    "n_needles": 2,
+    "desired_msg_index": 3,
+    "total_messages": 6,
+    "n_chars": 17460,
+    "date_added": "04-12-2025",
+    "token_count": 4279
+  },
+  "ingest_items": [
+    {
+      "tool": "memory_ingest_document",
+      "arguments": {
+        "key": "mrcr_v2_mrcr-0421",
+        "content": "[Artifact 0001]\nInstruction:\nwrite a short scene in a play about mothers\n\nResponse:\n**Title: Motherhood**\n\n**Scene 2: The Kitchen**\n\n*Setting: A cozy, slightly cluttered kitchen. The walls are adorned with children's drawings and family photos. A smell of freshly baked cookies lingers in the air. A round kitchen table sits center stage, with two chairs on either side. It is late afternoon and sunlight streams in through a window above the sink.*\n\n**Characters:**\n\n- **MARTHA**: An energetic woman in her late 40s, wearing an apron dusted with flour.\n- **LUCY**: Martha's teenage daughter, around 16, wearing a school uniform and sitting at the table, headphones around her neck.\n\n---\n\n**Martha** *(smiling as she places a tray of cookies on the table)*: Fresh out of the oven! You wouldn't believe how chaotic the bakery was today. I had to rush to get these ready in time.\n\n**Lucy** *(looking up and removing her headphones)*: Thanks, Mom. But you know you don’t have to do all this, right? I mean, you work all day. You should rest.\n\n**Martha** *(taking a seat, brushing aside Lucy’s concerns)*: Oh, nonsense. These are just as much therapy for me as they are treats for you. Besides, I know how much you love them.\n\n**Lucy** *(grabs a cookie, hesitating before speaking)*: Yeah, I do. But… you’re always doing everything for everyone. Ever think about what you want?\n\n**Martha** *(pausing, looking thoughtfully out the window)*: That's a tricky one. But, when I see you happy...when I see you growing and dreaming...that’s what I want. That's enough for me.\n\n**Lucy**: I get that. But it should be more than just taking care of me, you know? What about your dreams? Your art?\n\n**Martha** *(chuckling)*: Painting will always be there, waiting. But you’re growing up so fast, Lucy. This… being here with you now… it's the best masterpiece I'm creating.\n\n**Lucy** *(sighing, with half a smile)*: You’re too good to be true. But promise me you'll think about it more seriously, okay? Like, actually pursue it.\n\n**Martha** *(softly)*: I promise, sweetie. Now tell me about your day. You didn’t mention how the math test went.\n\n**Lucy**: Oh, well... *(reluctantly)* I think I should've traded those cookies for some flashcards. It was tough.\n\n**Martha** *(laughing)*: There’s always next time. And if we need to spend a weekend with books instead of bake-offs, I’m game.\n\n*They both laugh, sharing the moment, as the light outside begins to fade, enveloping them in the warmth of their shared space.*\n\n*The curtains gently fall as sound of clinking dishes and muffled laughter fills the room.*\n\n**---End Scene---**\n\n[Artifact 0002]\nInstruction:\nwrite a short scene in a play about mothers\n\nResponse:\nTitle: \"Echoes in the Kitchen\"\n\n**Scene: A cozy, warmly lit kitchen. Aromatic scents waft through the air. ANNA, a woman in her late 50s, is baking at the central table. Her daughter, LILA, in her 30s, enters, holding her baby, who is cooing softly. The light from the window casts a gentle glow around them.**\n\n---\n\n**ANNA**  \n(rolling dough)  \nWhen you were little, you would perch right there, watching me bake. Your eyes so wide, as if I were a magician.\n\n**LILA**  \n(grinning)  \nMom, you practically are. Your cinnamon rolls are legendary in three counties.\n\n**ANNA**  \n(chuckling)  \nOh, but they weren't always. Remember the time I forgot the sugar?\n\n**LILA**  \n(hands the baby a wooden spoon)  \nI do. Everyone was too polite to say a word until you noticed yourself.  \n\n**ANNA**  \nIt's those little things that make a family, I suppose. The stories, the laughter, even the mishaps.\n\n**LILA**  \n(softly)  \nI want that for her. I want her to grow up with memories that make her heart swell.\n\n**ANNA**  \n(placing a gentle hand on LILA's)  \nYou will, dear. You're already doing it. Look at you, both of you here, making this kitchen your own.\n\n**LILA**  \n(looks around, emotional)  \nI just realize how much I learned from you. Not just baking, but... everything.\n\n**ANNA**  \n(teasing)  \nCareful, or I'll start to cry into the dough.  \n\n**LILA**  \n(laughs, then serious)  \nI mean it, Mom. You showed me how to listen, to love, to forgive. To be strong.\n\n**ANNA**  \nAnd you taught me, too. Every day. It's the beauty of being a mother, Lila. We both grow.\n\n**LILA**  \n(breathes deeply)  \nI hope I'll be as good a mother to her as you were to me.\n\n**ANNA**  \n(smiling, teary-eyed)  \nYou already are. \n\n**(A soft silence follows as they share a knowing look. The baby giggles and waves the wooden spoon, breaking the moment with laughter.)**\n\n**LILA**  \n(gently tickles the baby's belly)  \nLet's show her that legendary family recipe then, shall we?\n\n**ANNA**  \nAbsolutely. But first, let's make sure we don't forget the sugar this time.\n\n**(They laugh, and the scene fades with the warmth of shared memories, continuing traditions, and the bonds between mothers and daughters.)**\n\n---",
+        "scope": "swarm-shared",
+        "source_id": "mrcr-0421_source",
+        "metadata": {
+          "benchmark": "mrcr_v2",
+          "example_id": "mrcr-0421",
+          "n_needles": 2,
+          "artifact_count": 2
+        }
+      },
+      "logical_source_id": "mrcr-0421_source",
+      "family": "document",
+      "metadata": {
+        "n_needles": 2,
+        "difficulty": "tok_4k_8k",
+        "artifact_count": 2,
+        "document_chars": 4885
+      }
+    }
+  ]
+}
