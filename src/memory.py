@@ -4257,19 +4257,12 @@ class MemoryServer:
                     rebuilt["_derived_write"].append(grant)
         self._instance_config = rebuilt
 
-    def _mark_tiers_dirty(self, *, preserve_derived_facts: list[dict] | None = None):
+    def _mark_tiers_dirty(self):
         """Mark derived tiers as stale and clear stale derived data."""
-        preserved_object_ids = {id(fact) for fact in preserve_derived_facts or []}
-
-        def keep_derived_fact(fact: dict) -> bool:
-            return _is_asserted_derived_fact(fact) or id(fact) in preserved_object_ids
-
         self._tiers_dirty = True
         self._temporal_index_dirty = True
-        self._all_cons = [f for f in self._all_cons if keep_derived_fact(f)]
-        self._all_cross = [
-            f for f in self._all_cross if keep_derived_fact(f) or _is_supported_cross_fact(f)
-        ]
+        self._all_cons = [f for f in self._all_cons if _is_asserted_derived_fact(f)]
+        self._all_cross = [f for f in self._all_cross if _is_supported_cross_fact(f)]
         self._mark_full_index_dirty()
 
     def _index_debounce_ms(self) -> int:
@@ -6231,27 +6224,7 @@ class MemoryServer:
             multipart_part_key=multipart_part_key,
         )
         info = self._content_dedup_index.get((domain, dedup_hash))
-        if isinstance(info, dict) and canonical_family == "conversation":
-            message_id = str(info.get("message_id") or "").strip()
-            if message_id and not self._message_id_has_active_extracted_fact(message_id):
-                return None
         return dict(info) if isinstance(info, dict) else None
-
-    def _message_id_has_active_extracted_fact(self, message_id: str) -> bool:
-        raw_session_ids = {
-            str(raw.get("raw_session_id") or "")
-            for raw in self._raw_sessions
-            if str(raw.get("message_id") or "").strip() == message_id
-            and str(raw.get("raw_session_id") or "").strip()
-            and str(raw.get("status") or "active") == "active"
-        }
-        if not raw_session_ids:
-            return False
-        return any(
-            str(fact.get("raw_session_id") or "") in raw_session_ids
-            and str(fact.get("status") or "active") == "active"
-            for fact in self._all_granular
-        )
 
     def _find_near_duplicate(
         self,
@@ -10458,16 +10431,6 @@ class MemoryServer:
             return int(value)
         return 0
 
-    def _raw_session_episode_id(self, raw_session: dict) -> str:
-        raw_episode_id = str(raw_session.get("episode_id") or "").strip()
-        if raw_episode_id:
-            return raw_episode_id
-        raw_source_id = str(raw_session.get("source_id") or raw_session.get("session_key") or "").strip()
-        raw_session_num = self._raw_session_num(raw_session)
-        if raw_source_id and raw_session_num is not None:
-            return f"{self._episode_source_key(raw_source_id)}_e{int(raw_session_num):04d}"
-        return ""
-
     def _fact_backed_message_ids(self) -> set[str]:
         raw_message_by_session_id = {
             str(raw.get("raw_session_id") or ""): str(raw.get("message_id") or "")
@@ -10591,20 +10554,9 @@ class MemoryServer:
             return self._raw_episode_visibility_cache
 
         by_family: dict[str, list[dict]] = defaultdict(list)
-        inactive_episode_ids = {
-            self._raw_session_episode_id(raw)
-            for raw in self._raw_sessions
-            if isinstance(raw, dict)
-            and str(raw.get("status") or "active") != "active"
-            and self._raw_session_episode_id(raw)
-        }
         for doc in self._episode_corpus.get("documents", []):
             for episode in doc.get("episodes", []):
                 if not isinstance(episode, dict):
-                    continue
-                if str(episode.get("status") or "active") != "active":
-                    continue
-                if str(episode.get("episode_id") or "").strip() in inactive_episode_ids:
                     continue
                 if not _record_semantic_ready(episode, fallback_text=str(episode.get("raw_text") or "")):
                     continue
@@ -10773,11 +10725,10 @@ class MemoryServer:
     def _recall_mirror_signal_terms(cls, family: str, axis: str) -> tuple[str, ...]:
         axis_meta = cls.RECALL_EXTRACTION_POLICY_MIRROR.get(family, {}).get(axis, {})
         values: list[Any] = []
-        if isinstance(axis_meta, dict):
-            for key in ("prompt_declared_signals", "query_signal_lemmas"):
-                raw_values = axis_meta.get(key)
-                if isinstance(raw_values, (list, tuple, set)):
-                    values.extend(raw_values)
+        for key in ("prompt_declared_signals", "query_signal_lemmas"):
+            raw_values = axis_meta.get(key)
+            if isinstance(raw_values, (list, tuple, set)):
+                values.extend(raw_values)
         return tuple(dict.fromkeys(str(value) for value in values if str(value).strip()))
 
     @classmethod
@@ -11210,10 +11161,9 @@ class MemoryServer:
             "source_id": raw_session.get("source_id"),
             "logical_source_id": raw_session.get("logical_source_id"),
             "session_key": raw_session.get("session_key"),
-            "raw_session_id": raw_session.get("raw_session_id"),
+            "status": raw_session.get("status") or "active",
             "artifact_id": raw_session.get("artifact_id"),
             "version_id": raw_session.get("version_id"),
-            "status": raw_session.get("status") or "active",
         }
 
     def _raw_entries_same_source(self, left: dict, right: dict) -> bool:
@@ -11253,8 +11203,6 @@ class MemoryServer:
         ] = defaultdict(list)
         for raw in self._raw_sessions:
             if not isinstance(raw, dict):
-                continue
-            if str(raw.get("status") or "active") != "active":
                 continue
             entry = self._raw_entry_from_session(raw)
             if self._raw_role(entry) != "assistant":
@@ -11555,12 +11503,7 @@ class MemoryServer:
             ]
             if str(ep_id or "").strip()
         }
-        no_visible_fact_result = str((result.get("runtime_trace") or {}).get("reason") or "") == "empty_visible_facts"
-        empty_fact_fallback = (
-            bool(families)
-            and not retrieved_items
-            and no_visible_fact_result
-        )
+        empty_fact_fallback = bool(families) and not retrieved_items
         include_raw_lane = (
             bool(raw_likely_trace and raw_likely_trace.get("raw_likely") is True)
             or empty_fact_fallback
@@ -11942,15 +11885,15 @@ class MemoryServer:
                     result = await self._extract_write_log_entry(entry)
                     if isinstance(result, dict) and result.get("error"):
                         if result.get("code") == "CANONICALIZATION_ERROR":
-                            error_metadata_patch = {
+                            metadata_patch = {
                                 "terminal_error_code": "CANONICALIZATION_ERROR",
                                 "canonicalization_status": "failed",
                                 "canonicalization_error": str(result.get("error") or ""),
                             }
                             for key in ("raw_session_id", "source_id", "extraction_format"):
                                 if result.get(key) is not None:
-                                    error_metadata_patch[key] = str(result[key])
-                            ingress_storage.merge_write_log_metadata(entry["message_id"], error_metadata_patch)
+                                    metadata_patch[key] = str(result[key])
+                            ingress_storage.merge_write_log_metadata(entry["message_id"], metadata_patch)
                             ingress_storage.mark_write_state(entry["message_id"], "complete")
                             processed += 1
                             continue
@@ -14279,7 +14222,7 @@ class MemoryServer:
             return {"status": "ok", "facts_extracted": 0}
 
         self._data_dict = None
-        self._mark_tiers_dirty(preserve_derived_facts=doc_cross)
+        self._mark_tiers_dirty()
         result = {"status": "ok", "facts_extracted": total_facts}
         if near_duplicate_warning:
             result["near_duplicate_warning"] = near_duplicate_warning
@@ -14910,7 +14853,7 @@ class MemoryServer:
             self._save_cache()
 
         self._data_dict = None
-        self._mark_tiers_dirty(preserve_derived_facts=doc_cross)
+        self._mark_tiers_dirty()
         result = {"status": "ok", "facts_extracted": total_facts}
         if near_duplicate_warning:
             result["near_duplicate_warning"] = near_duplicate_warning
@@ -16055,8 +15998,8 @@ class MemoryServer:
     async def build_index(self, *, _lease_acquired: bool = False) -> dict:
         """Embed current tiers and build retrieval state."""
         if not _lease_acquired and self._storage_supports_index_coordination():
-            storage = cast(Any, self._storage)
             now_ms = self._now_ms()
+            storage = cast(Any, self._storage)
             lease = storage.acquire_index_build_lease(
                 worker_id=self._worker_id,
                 snapshot_fingerprint=self._index_snapshot_fingerprint(),
@@ -16383,7 +16326,7 @@ class MemoryServer:
                 },
             }
 
-        def _with_raw_recall(result: dict, *, allow_raw: bool = True) -> dict:
+        def _with_raw_recall(result: dict) -> dict:
             runtime_trace = dict(result.get("runtime_trace") or {})
             runtime_trace["query_language"] = query_language_trace
             runtime_trace["query_canonicalization"] = query_trace
@@ -16401,16 +16344,15 @@ class MemoryServer:
                 runtime_trace["index"]["index_state_at_recall_start"] = full_index_status_at_start.get("index_state")
             result["runtime_trace"] = runtime_trace
             result["inference_leaf_plugins"] = dict(_effective_leaf_plugins)
-            if allow_raw:
-                result = self._merge_raw_recall(
-                    query=retrieval_query,
-                    result=result,
-                    caller_id=_caller_id,
-                    caller_memberships=_memberships,
-                    caller_role=_role,
-                    swarm_id=_swarm_for_raw,
-                    raw_kind=kind,
-                )
+            result = self._merge_raw_recall(
+                query=retrieval_query,
+                result=result,
+                caller_id=_caller_id,
+                caller_memberships=_memberships,
+                caller_role=_role,
+                swarm_id=_swarm_for_raw,
+                raw_kind=kind,
+            )
             result, _ = self._finalize_recall_evidence_context(
                 query=retrieval_query,
                 answer_query=answer_query,
@@ -16851,7 +16793,7 @@ class MemoryServer:
                     },
                     "tuning": get_runtime_tuning(),
                 },
-            }, allow_raw=kind == "all")
+            })
         return _with_raw_recall(await self._generic_fact_recall(
             query=retrieval_query,
             fact_filter=fact_filter,
@@ -17739,7 +17681,7 @@ class MemoryServer:
     def _recommended_profile_for_recall_result(self, recall_result: dict) -> str | None:
         if not self._has_profiles():
             return None
-        profiles = self._profiles or {}
+        profiles = self._profiles
         if not profiles:
             return None
         complexity_hint = recall_result.get("complexity_hint") or {}
@@ -20107,7 +20049,6 @@ class MemoryServer:
                         episode["status"] = "retracted"
             if found:
                 self._data_dict = None
-                self._bump_index_snapshot_version()
                 self._save_cache()
         if not found:
             return {"error": f"Artifact not found: {artifact_id}",

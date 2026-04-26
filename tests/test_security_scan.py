@@ -15,7 +15,7 @@ from tests._archive_repo import archive_repo_root
 
 
 def _load_security_scan_module():
-    module_path = Path(__file__).resolve().parents[1] / "ci" / "scripts" / "security_scan.py"
+    module_path = Path(__file__).resolve().parents[1] / "scripts" / "ci" / "security_scan.py"
     spec = importlib.util.spec_from_file_location("security_scan", module_path)
     assert spec is not None
     assert spec.loader is not None
@@ -49,25 +49,3 @@ def test_scan_text_handles_large_single_line_dataset_payload():
     payload = '{"transcript":"' + ("word " * 20000) + '", "note":"no secrets here"}'
     findings = security_scan.scan_text(path, payload, {})
     assert findings == []
-
-
-def test_scan_text_allows_placeholder_basic_auth_url_on_example_domain():
-    path = Path("src/example.rs")
-    url = "https://" + "user" + ":" + "pass" + "@" + "memory.example.com"
-    findings = security_scan.scan_text(
-        path,
-        f'validate_public_url("{url}").unwrap_err();',
-        {"basic_auth_url": security_scan.re.compile(security_scan.BUILTIN_PATTERNS["basic_auth_url"])},
-    )
-    assert findings == []
-
-
-def test_scan_text_rejects_non_placeholder_basic_auth_url():
-    path = Path("src/example.rs")
-    url = "https://" + "alice" + ":" + "hunter2" + "@" + "memory.example.com"
-    findings = security_scan.scan_text(
-        path,
-        f'let url = "{url}";',
-        {"basic_auth_url": security_scan.re.compile(security_scan.BUILTIN_PATTERNS["basic_auth_url"])},
-    )
-    assert findings

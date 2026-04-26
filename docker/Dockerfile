@@ -1,11 +1,10 @@
-# gosh-memory Docker image
-# Builds a minimal image with all runtime dependencies including SQLCipher.
+# Copyright (c) 2026 GOSH Operating Co., GOSH Technology Ltd., and Mitja Goroshevsky
+# SPDX-License-Identifier: LicenseRef-GOSH-Noncommercial-1.0
 #
-# Build:
-#   docker build -t gosh-memory:latest -f docker/Dockerfile .
-#
-# Run (via gosh CLI):
-#   gosh memory setup local --runtime docker --data-dir /path/to/data
+# Licensed under the GOSH.AI Noncommercial License, Version 1.0.
+# See LICENSE.md in the root of this repository for the full license
+# text. Use of this file for any Commercial Purpose requires a separate
+# written license. Contact: legal@gosh.sh
 
 FROM python:3.12-slim AS builder
 

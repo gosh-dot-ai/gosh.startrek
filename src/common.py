@@ -868,7 +868,6 @@ _LEMMA_CANON = {
     "gf": "girlfriend",
     "bf": "boyfriend",
     "recommendation": "recommend",
-    "recommendations": "recommend",
 }
 
 

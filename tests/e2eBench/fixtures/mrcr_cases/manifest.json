@@ -3,13 +3,13 @@
   "cases": [
     {
       "case_id": "mrcr-0458",
-      "benchmark_id": "mrcr_v2_r1776369412_mrcr-0458",
+      "benchmark_key": "mrcr_v2_r1776369412_mrcr-0458",
       "question_path": "dataset_records/mrcr-0458.question.txt",
       "example_path": "cases/mrcr-0458.example.json"
     },
     {
       "case_id": "mrcr-0421",
-      "benchmark_id": "mrcr_v2_r1776370194_mrcr-0421",
+      "benchmark_key": "mrcr_v2_r1776370194_mrcr-0421",
       "question_path": "dataset_records/mrcr-0421.question.txt",
       "example_path": "cases/mrcr-0421.example.json"
     }

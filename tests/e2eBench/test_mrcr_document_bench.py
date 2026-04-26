@@ -94,7 +94,7 @@ async def _seed_case_server(
 
     server = MemoryServer(
         str(tmp_path),
-        example["benchmark_id"],
+        example["benchmark_key"],
         extract_model="fixture-extract",
         swarm_id="mrcr-v2-bench",
     )
