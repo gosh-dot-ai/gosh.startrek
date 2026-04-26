@@ -2,7 +2,7 @@
 
 # gosh.startrek
 
-**GOSH.AI Memory — Community Edition**
+**GOSH.AI Memory — Advanced Edition (Noncommercial)**
 
 [![License: GOSH Noncommercial 1.0](https://img.shields.io/badge/license-GOSH%20Noncommercial%201.0-orange.svg)](LICENSE.md)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-green.svg)](https://python.org)
@@ -15,19 +15,30 @@
 > [!IMPORTANT]
 > **This repository is a temporary home.**
 >
-> `gosh.startrek` is a snapshot of [`gosh.memory`](https://github.com/gosh-dot-ai/gosh.memory)
-> published under the [GOSH.AI Noncommercial License v1.0](LICENSE.md)
-> while we refactor the upstream codebase to support a clean dual-
-> license setup.
+> `gosh.startrek` is the **advanced edition** of `gosh.memory` —
+> a feature-richer build than what currently ships on
+> [`gosh-dot-ai/gosh.memory`](https://github.com/gosh-dot-ai/gosh.memory)'s
+> `main`. It lives in this separate repo, under the
+> [GOSH.AI Noncommercial License v1.0](LICENSE.md), while the upstream
+> codebase is being refactored to support a clean **dual-license**
+> setup at the component level.
 >
-> Once the dual-license refactor lands, this repository's contents
-> will be **merged back into `main` of
+> Once that refactor lands, this repository's contents will be
+> **merged into `main` of
 > [`gosh-dot-ai/gosh.memory`](https://github.com/gosh-dot-ai/gosh.memory)**,
-> which will then ship under both licenses (commercial via separate
-> written agreement; noncommercial under [LICENSE.md](LICENSE.md)).
+> and `gosh.memory` will then ship under **two licenses,
+> per-component**:
 >
-> Until that merge happens, treat any code in this repo as licensed
-> **only** under the noncommercial terms.
+> - **MIT** — for the components currently in `gosh.memory` `main`
+>   under MIT (unchanged).
+> - **GOSH.AI Noncommercial License v1.0** — for the advanced
+>   components contributed from this repo.
+>
+> Each source file will carry its own SPDX license tag so the boundary
+> is unambiguous.
+>
+> Until the merge happens, every file in this repo is licensed
+> **only** under the noncommercial terms in [LICENSE.md](LICENSE.md).
 
 ---
 
@@ -89,6 +100,16 @@ product — requires a separate written license. Contact
 `legal@gosh.sh`.
 
 The full license text is in [LICENSE.md](LICENSE.md).
+
+> **Note on the future dual-license model.** When this repo is
+> merged into [`gosh-dot-ai/gosh.memory`](https://github.com/gosh-dot-ai/gosh.memory),
+> the resulting codebase will be **dual-licensed per-component**:
+> existing MIT-licensed components in `gosh.memory` stay MIT; the
+> advanced components contributed from this repo stay under the
+> GOSH.AI Noncommercial License v1.0. This is not a Contributor-
+> License-Agreement / re-licensing arrangement — each file keeps the
+> license it was published under, identified by an SPDX tag in its
+> header.
 
 ---
 
