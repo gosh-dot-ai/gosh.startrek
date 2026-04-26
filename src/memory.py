@@ -3517,6 +3517,25 @@ def _is_supported_cross_fact(fact: dict) -> bool:
     return bool(metadata.get("source_aggregation") or metadata.get("asserted_derived_tier"))
 
 
+def _stamp_source_aggregation_source(facts: list[dict], source_id: str, source_kind: str | None = None) -> None:
+    for fact in facts or []:
+        fact.setdefault("source_id", source_id)
+        metadata = fact.setdefault("metadata", {})
+        metadata.setdefault("source_id", source_id)
+        if source_kind:
+            metadata.setdefault("source_kind", source_kind)
+
+
+def _lifecycle_status(record: dict | None) -> str:
+    if not isinstance(record, dict):
+        return "active"
+    return str(record.get("status") or "active").strip() or "active"
+
+
+def _is_active_lifecycle_record(record: dict | None) -> bool:
+    return _lifecycle_status(record) == "active"
+
+
 def _fact_matches_structured_filter(
     fact: dict,
     filter: dict | None,
@@ -4071,7 +4090,7 @@ class MemoryServer:
             # Legacy auto-generated merge tiers are no longer part of the production path.
             # Keep asserted derived tiers and source-aggregation cross facts.
             self._all_cons = [f for f in self._all_cons if _is_asserted_derived_fact(f)]
-            self._all_cross = [f for f in self._all_cross if _is_supported_cross_fact(f)]
+            self._all_cross = [f for f in self._all_cross if self._is_current_supported_cross_fact(f)]
             # Load fingerprints and pre-load embeddings if fingerprint matches
             self._emb_fingerprints = cached.get("_emb_fingerprints", {})
             current_fps = {
@@ -4222,7 +4241,7 @@ class MemoryServer:
             self._apply_memory_config(next_config)
 
         self._all_cons = [f for f in self._all_cons if _is_asserted_derived_fact(f)]
-        self._all_cross = [f for f in self._all_cross if _is_supported_cross_fact(f)]
+        self._all_cross = [f for f in self._all_cross if self._is_current_supported_cross_fact(f)]
         self._initialize_scope_registry()
         self._rebuild_instance_acl_from_sources()
         self._refresh_secret_summaries()
@@ -4257,12 +4276,19 @@ class MemoryServer:
                     rebuilt["_derived_write"].append(grant)
         self._instance_config = rebuilt
 
-    def _mark_tiers_dirty(self):
+    def _mark_tiers_dirty(self, *, preserve_derived_facts: list[dict] | None = None):
         """Mark derived tiers as stale and clear stale derived data."""
+        preserved_object_ids = {id(fact) for fact in preserve_derived_facts or []}
+
+        def keep_derived_fact(fact: dict) -> bool:
+            return _is_asserted_derived_fact(fact) or id(fact) in preserved_object_ids
+
         self._tiers_dirty = True
         self._temporal_index_dirty = True
-        self._all_cons = [f for f in self._all_cons if _is_asserted_derived_fact(f)]
-        self._all_cross = [f for f in self._all_cross if _is_supported_cross_fact(f)]
+        self._all_cons = [f for f in self._all_cons if keep_derived_fact(f)]
+        self._all_cross = [
+            f for f in self._all_cross if keep_derived_fact(f) or self._is_current_supported_cross_fact(f)
+        ]
         self._mark_full_index_dirty()
 
     def _index_debounce_ms(self) -> int:
@@ -6165,6 +6191,96 @@ class MemoryServer:
         metadata = raw_session.get("metadata")
         return MemoryServer._multipart_part_key(metadata if isinstance(metadata, dict) else None)
 
+    def _active_granular_facts_for_content_entry(self, info: dict) -> list[dict]:
+        """Return active semantic evidence proving a conversation content duplicate.
+
+        Raw sessions are lifecycle artifacts, not semantic evidence. Conversation
+        exact content dedup only becomes authoritative after at least one active
+        extracted fact can be linked to the stored raw artifact. Legacy imports
+        may miss raw_session_id, so fall back through message_id and then the
+        source/session tuple.
+        """
+        if not isinstance(info, dict):
+            return []
+        message_id = str(info.get("message_id") or "").strip()
+        source_id = str(info.get("source_id") or "").strip()
+        session_num = _coerce_positive_session_num(info.get("session_num"))
+        raw_session_ids = {
+            str(raw.get("raw_session_id") or "").strip()
+            for raw in self._raw_sessions
+            if _is_active_lifecycle_record(raw)
+            and message_id
+            and str(raw.get("message_id") or "").strip() == message_id
+            and str(raw.get("raw_session_id") or "").strip()
+        }
+        active_facts = [fact for fact in self._all_granular if _is_active_lifecycle_record(fact)]
+        if raw_session_ids:
+            linked = [
+                fact for fact in active_facts
+                if str(fact.get("raw_session_id") or "").strip() in raw_session_ids
+            ]
+            if linked:
+                return linked
+        if message_id:
+            linked = [
+                fact for fact in active_facts
+                if str(fact.get("message_id") or "").strip() == message_id
+            ]
+            if linked:
+                return linked
+        if source_id and session_num is not None:
+            return [
+                fact for fact in active_facts
+                if str(fact.get("source_id") or "").strip() == source_id
+                and (
+                    _coerce_positive_session_num(fact.get("session")) == session_num
+                    or _coerce_positive_session_num(fact.get("session_num")) == session_num
+                    or _coerce_positive_session_num(fact.get("projection_session_num")) == session_num
+                )
+            ]
+        return []
+
+    def _is_current_supported_cross_fact(self, fact: dict) -> bool:
+        if _is_asserted_derived_fact(fact):
+            return _is_active_lifecycle_record(fact)
+        if not _is_supported_cross_fact(fact) or not _is_active_lifecycle_record(fact):
+            return False
+        metadata = fact.get("metadata") or {}
+        source_id = str(
+            fact.get("source_id")
+            or metadata.get("source_id")
+            or metadata.get("episode_source_id")
+            or ""
+        ).strip()
+        if not source_id:
+            return False
+        source_record = self._source_records.get(source_id) or {}
+        source_version = str(source_record.get("version_id") or "").strip()
+        source_artifact = str(source_record.get("artifact_id") or "").strip()
+        fact_version = str(fact.get("version_id") or "").strip()
+        fact_artifact = str(fact.get("artifact_id") or "").strip()
+        if source_version and fact_version != source_version:
+            return False
+        if source_artifact and fact_artifact != source_artifact:
+            return False
+        for source_fact in self._all_granular:
+            if not _is_active_lifecycle_record(source_fact):
+                continue
+            if str(source_fact.get("source_id") or "") != source_id:
+                continue
+            source_fact_version = str(source_fact.get("version_id") or "").strip()
+            if source_version and source_fact_version != source_version:
+                continue
+            if fact_version and source_fact_version and source_fact_version != fact_version:
+                continue
+            source_fact_artifact = str(source_fact.get("artifact_id") or "").strip()
+            if source_artifact and source_fact_artifact != source_artifact:
+                continue
+            if fact_artifact and source_fact_artifact and source_fact_artifact != fact_artifact:
+                continue
+            return True
+        return False
+
     def _source_record_acl_context(self, source_id: str) -> tuple[str, str | None, str | None]:
         return self._source_record_acl_context_from_record(self._source_records.get(source_id) or {})
 
@@ -6224,7 +6340,11 @@ class MemoryServer:
             multipart_part_key=multipart_part_key,
         )
         info = self._content_dedup_index.get((domain, dedup_hash))
-        return dict(info) if isinstance(info, dict) else None
+        if not isinstance(info, dict):
+            return None
+        if canonical_family == "conversation" and not self._active_granular_facts_for_content_entry(info):
+            return None
+        return dict(info)
 
     def _find_near_duplicate(
         self,
@@ -6281,12 +6401,12 @@ class MemoryServer:
         eligible_raw_session_ids = {
             str(f.get("raw_session_id") or "")
             for f in self._all_granular
-            if str(f.get("status") or "active") == "active" and str(f.get("raw_session_id") or "")
+            if _is_active_lifecycle_record(f) and str(f.get("raw_session_id") or "")
         }
         eligible_document_sources = {
             str(f.get("source_id") or "")
             for f in self._all_granular
-            if str(f.get("status") or "active") == "active"
+            if _is_active_lifecycle_record(f)
             and str(f.get("source_id") or "")
             and self._canonical_content_family((self._source_records.get(str(f.get("source_id") or "")) or {}).get("family") or "conversation") != "conversation"
         }
@@ -6304,7 +6424,7 @@ class MemoryServer:
         }
 
         for raw_session in self._raw_sessions:
-            if str(raw_session.get("status") or "active") != "active":
+            if not _is_active_lifecycle_record(raw_session):
                 continue
             if (
                 str(raw_session.get("raw_session_id") or "")
@@ -6320,7 +6440,7 @@ class MemoryServer:
                 same_part = [
                     rs for rs in self._raw_sessions
                     if self._canonical_content_family(rs.get("format") or "conversation") == family
-                    and str(rs.get("status") or "active") == "active"
+                    and _is_active_lifecycle_record(rs)
                     and str(rs.get("source_id") or "") == source_id
                     and self._raw_session_part_key(rs) == part_key
                     and str(rs.get("message_id") or "") == str(raw_session.get("message_id") or "")
@@ -6374,7 +6494,7 @@ class MemoryServer:
             matching_sessions = [
                 rs for rs in self._raw_sessions
                 if rs.get("format") == "document"
-                and str(rs.get("status") or "active") == "active"
+                and _is_active_lifecycle_record(rs)
                 and str(rs.get("source_id") or "") == str(source_id)
             ]
             matching_sessions.sort(key=lambda rs: int(rs.get("session_num") or 0))
@@ -10431,14 +10551,26 @@ class MemoryServer:
             return int(value)
         return 0
 
+    def _raw_session_episode_id(self, raw_session: dict) -> str:
+        raw_episode_id = str(raw_session.get("episode_id") or "").strip()
+        if raw_episode_id:
+            return raw_episode_id
+        raw_source_id = str(raw_session.get("source_id") or raw_session.get("session_key") or "").strip()
+        raw_session_num = self._raw_session_num(raw_session)
+        if raw_source_id and raw_session_num is not None:
+            return f"{self._episode_source_key(raw_source_id)}_e{int(raw_session_num):04d}"
+        return ""
+
     def _fact_backed_message_ids(self) -> set[str]:
         raw_message_by_session_id = {
             str(raw.get("raw_session_id") or ""): str(raw.get("message_id") or "")
             for raw in self._raw_sessions
-            if str(raw.get("raw_session_id") or "").strip()
+            if _is_active_lifecycle_record(raw) and str(raw.get("raw_session_id") or "").strip()
         }
         backed: set[str] = set()
         for fact in self._all_granular:
+            if not _is_active_lifecycle_record(fact):
+                continue
             message_id = str(fact.get("message_id") or "").strip()
             if message_id:
                 backed.add(message_id)
@@ -10452,7 +10584,7 @@ class MemoryServer:
         raw_message_by_session_id = {
             str(raw.get("raw_session_id") or ""): str(raw.get("message_id") or "")
             for raw in self._raw_sessions
-            if str(raw.get("raw_session_id") or "").strip()
+            if _is_active_lifecycle_record(raw) and str(raw.get("raw_session_id") or "").strip()
         }
         selected: set[str] = set()
         for item in retrieved_items:
@@ -10554,9 +10686,20 @@ class MemoryServer:
             return self._raw_episode_visibility_cache
 
         by_family: dict[str, list[dict]] = defaultdict(list)
+        inactive_episode_ids = {
+            self._raw_session_episode_id(raw)
+            for raw in self._raw_sessions
+            if isinstance(raw, dict)
+            and str(raw.get("status") or "active") != "active"
+            and self._raw_session_episode_id(raw)
+        }
         for doc in self._episode_corpus.get("documents", []):
             for episode in doc.get("episodes", []):
                 if not isinstance(episode, dict):
+                    continue
+                if str(episode.get("status") or "active") != "active":
+                    continue
+                if str(episode.get("episode_id") or "").strip() in inactive_episode_ids:
                     continue
                 if not _record_semantic_ready(episode, fallback_text=str(episode.get("raw_text") or "")):
                     continue
@@ -10575,6 +10718,59 @@ class MemoryServer:
         self._raw_episode_visibility_cache_version = self._index_snapshot_version
         return self._raw_episode_visibility_cache
 
+    @staticmethod
+    def _session_num_identity(value: Any) -> str:
+        num = _coerce_positive_session_num(value)
+        return str(num) if num is not None else ""
+
+    def _raw_session_matches_episode_identity(self, raw: dict, episode: dict) -> bool:
+        episode_artifact = str(episode.get("artifact_id") or "").strip()
+        episode_version = str(episode.get("version_id") or "").strip()
+        if episode_artifact and episode_version:
+            return (
+                str(raw.get("artifact_id") or "").strip() == episode_artifact
+                and str(raw.get("version_id") or "").strip() == episode_version
+            )
+        episode_raw_session_id = str(episode.get("raw_session_id") or "").strip()
+        if episode_raw_session_id:
+            return str(raw.get("raw_session_id") or "").strip() == episode_raw_session_id
+        episode_message_id = str(episode.get("message_id") or "").strip()
+        if not episode_message_id or str(raw.get("message_id") or "").strip() != episode_message_id:
+            return False
+        episode_source = str(
+            episode.get("source_id")
+            or episode.get("session_id")
+            or episode.get("logical_source_id")
+            or ""
+        ).strip()
+        raw_sources = {
+            str(raw.get("source_id") or "").strip(),
+            str(raw.get("logical_source_id") or "").strip(),
+            str(raw.get("session_key") or "").strip(),
+        }
+        if episode_source and episode_source not in raw_sources:
+            return False
+        episode_nums = {
+            self._session_num_identity(episode.get("projection_session_num")),
+            self._session_num_identity(episode.get("session_num")),
+        } - {""}
+        raw_nums = {
+            self._session_num_identity(raw.get("projection_session_num")),
+            self._session_num_identity(raw.get("session_num")),
+        } - {""}
+        return not episode_nums or not raw_nums or bool(episode_nums & raw_nums)
+
+    def _raw_backing_record_is_active_for_episode(self, episode: dict) -> bool:
+        if not _is_active_lifecycle_record(episode):
+            return False
+        matching_raw = [
+            raw for raw in self._raw_sessions
+            if isinstance(raw, dict) and self._raw_session_matches_episode_identity(raw, episode)
+        ]
+        if not matching_raw:
+            return True
+        return any(_is_active_lifecycle_record(raw) for raw in matching_raw)
+
     def _iter_visible_raw_episodes(
         self,
         *,
@@ -10586,25 +10782,9 @@ class MemoryServer:
     ) -> list[dict]:
         episodes: list[dict] = []
         visibility_index = self._raw_episode_visibility_index()
-        raw_status_by_message_id = {
-            str(raw.get("message_id") or ""): str(raw.get("status") or "active")
-            for raw in self._raw_sessions
-            if str(raw.get("message_id") or "").strip()
-        }
-        raw_status_by_raw_session_id = {
-            str(raw.get("raw_session_id") or ""): str(raw.get("status") or "active")
-            for raw in self._raw_sessions
-            if str(raw.get("raw_session_id") or "").strip()
-        }
         for family in sorted(families):
             for episode in visibility_index.get(family, ()):
-                if str(episode.get("status") or "active") != "active":
-                    continue
-                message_id = str(episode.get("message_id") or "")
-                raw_session_id = str(episode.get("raw_session_id") or "")
-                if message_id and raw_status_by_message_id.get(message_id, "active") != "active":
-                    continue
-                if raw_session_id and raw_status_by_raw_session_id.get(raw_session_id, "active") != "active":
+                if not self._raw_backing_record_is_active_for_episode(episode):
                     continue
                 if swarm_id and swarm_id != "default" and self._episode_effective_swarm_id(episode) != swarm_id:
                     continue
@@ -10725,10 +10905,11 @@ class MemoryServer:
     def _recall_mirror_signal_terms(cls, family: str, axis: str) -> tuple[str, ...]:
         axis_meta = cls.RECALL_EXTRACTION_POLICY_MIRROR.get(family, {}).get(axis, {})
         values: list[Any] = []
-        for key in ("prompt_declared_signals", "query_signal_lemmas"):
-            raw_values = axis_meta.get(key)
-            if isinstance(raw_values, (list, tuple, set)):
-                values.extend(raw_values)
+        if isinstance(axis_meta, dict):
+            for key in ("prompt_declared_signals", "query_signal_lemmas"):
+                raw_values = axis_meta.get(key)
+                if isinstance(raw_values, (list, tuple, set)):
+                    values.extend(raw_values)
         return tuple(dict.fromkeys(str(value) for value in values if str(value).strip()))
 
     @classmethod
@@ -11161,9 +11342,10 @@ class MemoryServer:
             "source_id": raw_session.get("source_id"),
             "logical_source_id": raw_session.get("logical_source_id"),
             "session_key": raw_session.get("session_key"),
-            "status": raw_session.get("status") or "active",
+            "raw_session_id": raw_session.get("raw_session_id"),
             "artifact_id": raw_session.get("artifact_id"),
             "version_id": raw_session.get("version_id"),
+            "status": raw_session.get("status") or "active",
         }
 
     def _raw_entries_same_source(self, left: dict, right: dict) -> bool:
@@ -11204,6 +11386,8 @@ class MemoryServer:
         for raw in self._raw_sessions:
             if not isinstance(raw, dict):
                 continue
+            if not _is_active_lifecycle_record(raw):
+                continue
             entry = self._raw_entry_from_session(raw)
             if self._raw_role(entry) != "assistant":
                 continue
@@ -11227,6 +11411,8 @@ class MemoryServer:
             if matched is None:
                 continue
             _identity, _session_num, raw_session = matched
+            if not _is_active_lifecycle_record(raw_session):
+                continue
             question_entry = self._raw_entry_from_session(raw_session)
             question_role = self._raw_role(question_entry)
             question_text = str(question_entry.get("content") or "").strip()
@@ -11503,7 +11689,11 @@ class MemoryServer:
             ]
             if str(ep_id or "").strip()
         }
-        empty_fact_fallback = bool(families) and not retrieved_items
+        empty_fact_fallback = (
+            bool(families)
+            and not retrieved_items
+            and str(runtime_trace.get("reason") or "") == "empty_visible_facts"
+        )
         include_raw_lane = (
             bool(raw_likely_trace and raw_likely_trace.get("raw_likely") is True)
             or empty_fact_fallback
@@ -11885,15 +12075,15 @@ class MemoryServer:
                     result = await self._extract_write_log_entry(entry)
                     if isinstance(result, dict) and result.get("error"):
                         if result.get("code") == "CANONICALIZATION_ERROR":
-                            metadata_patch = {
+                            error_metadata_patch = {
                                 "terminal_error_code": "CANONICALIZATION_ERROR",
                                 "canonicalization_status": "failed",
                                 "canonicalization_error": str(result.get("error") or ""),
                             }
                             for key in ("raw_session_id", "source_id", "extraction_format"):
                                 if result.get(key) is not None:
-                                    metadata_patch[key] = str(result[key])
-                            ingress_storage.merge_write_log_metadata(entry["message_id"], metadata_patch)
+                                    error_metadata_patch[key] = str(result[key])
+                            ingress_storage.merge_write_log_metadata(entry["message_id"], error_metadata_patch)
                             ingress_storage.mark_write_state(entry["message_id"], "complete")
                             processed += 1
                             continue
@@ -14090,6 +14280,7 @@ class MemoryServer:
                 agent_id=_agent_id or "default",
             )
             _namespace_derived_fact_ids(substrate_cross, f"substrate_{self._episode_source_key(projection_source_id)}")
+            _stamp_source_aggregation_source(substrate_cross, projection_source_id, family)
             max_doc_cc = max((f.get("_session_content_complexity", 0.0) for f in doc_granular), default=0.0)
             for fact in substrate_cross:
                 fact["_session_content_complexity"] = max_doc_cc
@@ -14222,7 +14413,7 @@ class MemoryServer:
             return {"status": "ok", "facts_extracted": 0}
 
         self._data_dict = None
-        self._mark_tiers_dirty()
+        self._mark_tiers_dirty(preserve_derived_facts=doc_cross)
         result = {"status": "ok", "facts_extracted": total_facts}
         if near_duplicate_warning:
             result["near_duplicate_warning"] = near_duplicate_warning
@@ -14749,6 +14940,7 @@ class MemoryServer:
             agent_id=_agent_id or "default",
         )
         _namespace_derived_fact_ids(substrate_cross, f"substrate_{self._episode_source_key(projection_source_id)}")
+        _stamp_source_aggregation_source(substrate_cross, projection_source_id, family)
         max_doc_cc = max((f.get("_session_content_complexity", 0.0) for f in doc_granular), default=0.0)
         for fact in substrate_cross:
             fact["_session_content_complexity"] = max_doc_cc
@@ -14853,7 +15045,7 @@ class MemoryServer:
             self._save_cache()
 
         self._data_dict = None
-        self._mark_tiers_dirty()
+        self._mark_tiers_dirty(preserve_derived_facts=doc_cross)
         result = {"status": "ok", "facts_extracted": total_facts}
         if near_duplicate_warning:
             result["near_duplicate_warning"] = near_duplicate_warning
@@ -15998,8 +16190,8 @@ class MemoryServer:
     async def build_index(self, *, _lease_acquired: bool = False) -> dict:
         """Embed current tiers and build retrieval state."""
         if not _lease_acquired and self._storage_supports_index_coordination():
-            now_ms = self._now_ms()
             storage = cast(Any, self._storage)
+            now_ms = self._now_ms()
             lease = storage.acquire_index_build_lease(
                 worker_id=self._worker_id,
                 snapshot_fingerprint=self._index_snapshot_fingerprint(),
@@ -17681,7 +17873,7 @@ class MemoryServer:
     def _recommended_profile_for_recall_result(self, recall_result: dict) -> str | None:
         if not self._has_profiles():
             return None
-        profiles = self._profiles
+        profiles = self._profiles or {}
         if not profiles:
             return None
         complexity_hint = recall_result.get("complexity_hint") or {}
@@ -20024,6 +20216,7 @@ class MemoryServer:
 
         found = False
         async with self._file_lock:
+            affected_message_ids: set[str] = set()
             for f in self._all_granular:
                 if f.get("artifact_id") == artifact_id:
                     f["status"] = "retracted"
@@ -20042,13 +20235,25 @@ class MemoryServer:
                     found = True
                     message_id = str(rs.get("message_id") or "")
                     if message_id:
+                        affected_message_ids.add(message_id)
                         self._remove_content_indices_for_message(message_id)
             for doc in self._episode_corpus.get("documents", []):
                 for episode in doc.get("episodes", []):
                     if isinstance(episode, dict) and episode.get("artifact_id") == artifact_id:
                         episode["status"] = "retracted"
+                        found = True
+                        message_id = str(episode.get("message_id") or "")
+                        if message_id:
+                            affected_message_ids.add(message_id)
+            for key, value in list(self._dedup_index.items()):
+                if (value or {}).get("artifact_id") == artifact_id:
+                    self._dedup_index.pop(key, None)
+            for message_id in affected_message_ids:
+                self._remove_content_indices_for_message(message_id)
             if found:
                 self._data_dict = None
+                self._mark_full_index_dirty()
+                self._bump_index_snapshot_version()
                 self._save_cache()
         if not found:
             return {"error": f"Artifact not found: {artifact_id}",

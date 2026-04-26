@@ -911,6 +911,95 @@ async def test_store_exact_content_dedup_blocks_across_source_ids_with_normaliza
     assert len(ms._raw_sessions) == 1
 
 
+def test_conversation_exact_dedup_ignores_raw_only_candidate(tmp_path):
+    ms = MemoryServer(str(tmp_path), "raw_only_not_duplicate")
+    ms._raw_sessions = [{
+        "raw_session_id": "raw-zero",
+        "message_id": "msg-zero",
+        "source_id": "SRC-ZERO",
+        "session_num": 1,
+        "status": "active",
+        "format": "conversation",
+        "content": "raw only duplicate text",
+        "scope": "swarm-shared",
+        "owner_id": "system",
+        "swarm_id": "default",
+    }]
+    ms._index_content_entry(
+        message_id="msg-zero",
+        source_id="SRC-ZERO",
+        session_num=1,
+        stored_at="2024-06-01T00:00:00+00:00",
+        scope="swarm-shared",
+        owner_id="system",
+        swarm_id="default",
+        family="conversation",
+        content="raw only duplicate text",
+    )
+
+    assert ms._find_exact_duplicate(
+        content="raw only duplicate text",
+        family="conversation",
+        scope="swarm-shared",
+        owner_id="system",
+        swarm_id="default",
+    ) is None
+
+
+def test_conversation_exact_dedup_requires_active_semantic_evidence(tmp_path):
+    ms = MemoryServer(str(tmp_path), "semantic_duplicate_links")
+    base_raw = {
+        "raw_session_id": "raw-active",
+        "message_id": "msg-active",
+        "source_id": "SRC-ACTIVE",
+        "session_num": 3,
+        "status": "active",
+        "format": "conversation",
+        "content": "semantic duplicate text",
+        "scope": "swarm-shared",
+        "owner_id": "system",
+        "swarm_id": "default",
+    }
+    for fact in (
+        {"id": "by-raw", "raw_session_id": "raw-active", "status": "active"},
+        {"id": "by-message", "message_id": "msg-active", "status": "active"},
+        {"id": "by-legacy-tuple", "source_id": "SRC-ACTIVE", "session": 3, "status": "active"},
+    ):
+        ms._raw_sessions = [dict(base_raw)]
+        ms._all_granular = [dict(fact)]
+        ms._content_dedup_index = {}
+        ms._simhash_index = {}
+        ms._index_content_entry(
+            message_id="msg-active",
+            source_id="SRC-ACTIVE",
+            session_num=3,
+            stored_at="2024-06-01T00:00:00+00:00",
+            scope="swarm-shared",
+            owner_id="system",
+            swarm_id="default",
+            family="conversation",
+            content="semantic duplicate text",
+        )
+        duplicate = ms._find_exact_duplicate(
+            content="semantic duplicate text",
+            family="conversation",
+            scope="swarm-shared",
+            owner_id="system",
+            swarm_id="default",
+        )
+        assert duplicate is not None, fact["id"]
+        assert duplicate["message_id"] == "msg-active"
+
+    ms._all_granular = [{"id": "retracted", "raw_session_id": "raw-active", "status": "retracted"}]
+    assert ms._find_exact_duplicate(
+        content="semantic duplicate text",
+        family="conversation",
+        scope="swarm-shared",
+        owner_id="system",
+        swarm_id="default",
+    ) is None
+
+
 @pytest.mark.asyncio
 async def test_store_exact_content_dedup_isolated_by_acl_domain(tmp_path, monkeypatch):
     _patch_all(monkeypatch, n_facts=1)
@@ -1374,6 +1463,27 @@ async def test_recall_is_evidence_only_and_does_not_build_payload_or_call_models
 
 
 @pytest.mark.asyncio
+async def test_recall_with_profile_configs_but_no_profile_map_does_not_error(tmp_path, monkeypatch):
+    _patch_all(monkeypatch)
+    _profiles, profile_configs = _planning_profiles()
+    ms = MemoryServer(str(tmp_path), "recall_profile_configs_only", profiles=None, profile_configs=profile_configs)
+    await _store(
+        ms,
+        "User: The runtime color is amber.\nAssistant: Stored.",
+        session_num=1,
+        session_date="2024-06-01",
+        agent_id="tester",
+    )
+
+    result = await ms.recall("What color is the runtime?", agent_id="tester")
+
+    assert "RECALL_ERROR" not in str(result.get("code") or "")
+    assert "context" in result
+    assert result["runtime_trace"]["evidence_context"]["finalized"] is False
+    assert result["runtime_trace"]["evidence_context"]["reason"] == "no_inference_target"
+
+
+@pytest.mark.asyncio
 async def test_recall_non_english_query_blocks_without_extraction_call(tmp_path, monkeypatch):
     _patch_all(monkeypatch)
     ms = MemoryServer(str(tmp_path), "recall_non_english")
@@ -1678,6 +1788,7 @@ async def _recall_as_agent_b(
     query: str,
     *,
     query_type: str = "lookup",
+    kind: str = "all",
     memberships: list[str] | None = None,
 ):
     return await ms.recall(
@@ -1687,7 +1798,7 @@ async def _recall_as_agent_b(
         search_family="conversation",
         token_budget=4000,
         query_type=query_type,
-        kind="all",
+        kind=kind,
         caller_id="agent:agent-b",
         caller_memberships=memberships if memberships is not None else ["swarm:team-gosh"],
         caller_role="agent",
@@ -1825,6 +1936,110 @@ def test_visible_raw_episode_prefilter_is_cached_per_snapshot(tmp_path, monkeypa
     assert calls == 2
 
 
+def test_raw_episode_lifecycle_visibility_uses_stable_identity(tmp_path, monkeypatch):
+    ms = MemoryServer(str(tmp_path), "raw_lifecycle_identity")
+    monkeypatch.setattr(ms, "_episode_acl_allows", lambda *args, **kwargs: True)
+    ms._raw_sessions = [
+        {
+            "raw_session_id": "raw-old",
+            "message_id": "same-message",
+            "source_id": "chat",
+            "session_num": 1,
+            "artifact_id": "artifact-old",
+            "version_id": "v1",
+            "status": "retracted",
+            "format": "conversation",
+        },
+        {
+            "raw_session_id": "raw-new",
+            "message_id": "same-message",
+            "source_id": "chat",
+            "session_num": 2,
+            "artifact_id": "artifact-new",
+            "version_id": "v2",
+            "status": "active",
+            "format": "conversation",
+        },
+    ]
+    ms._episode_corpus = {
+        "documents": [{
+            "doc_id": "conversation:chat",
+            "episodes": [
+                {
+                    "episode_id": "old",
+                    "source_id": "chat",
+                    "source_type": "conversation",
+                    "message_id": "same-message",
+                    "artifact_id": "artifact-old",
+                    "version_id": "v1",
+                    "raw_text": "old hidden text",
+                },
+                {
+                    "episode_id": "new",
+                    "source_id": "chat",
+                    "source_type": "conversation",
+                    "message_id": "same-message",
+                    "artifact_id": "artifact-new",
+                    "version_id": "v2",
+                    "raw_text": "new visible text",
+                },
+                {
+                    "episode_id": "legacy-no-status",
+                    "source_id": "legacy",
+                    "source_type": "conversation",
+                    "raw_text": "legacy visible text",
+                },
+            ],
+        }]
+    }
+
+    visible = ms._iter_visible_raw_episodes(
+        families={"conversation"},
+        caller_id="agent:agent-b",
+        caller_memberships=["agent:PUBLIC"],
+        caller_role="agent",
+        swarm_id=None,
+    )
+
+    assert [episode["episode_id"] for episode in visible] == ["new", "legacy-no-status"]
+
+
+@pytest.mark.asyncio
+async def test_retracted_adjacent_assistant_raw_is_not_visible(tmp_path, monkeypatch):
+    async def _extract_session(**kwargs):
+        text = str(kwargs.get("session_text") or "")
+        sn = int(kwargs.get("session_num") or 1)
+        facts = []
+        if "What is the access code" in text:
+            facts.append({
+                "id": "question",
+                "fact": "The user asked for the access code.",
+                "kind": "event",
+                "entities": [],
+                "tags": [],
+                "session": sn,
+            })
+        return ("conv", sn, kwargs.get("session_date", "2024-06-01"), facts, [])
+
+    _patch_conversation_raw_recall_runtime(monkeypatch, _extract_session)
+    ms = MemoryServer(str(tmp_path), "retracted_adjacent")
+    await _write_chat_turn(ms, message_id="question", content="What is the access code?", turn_number=1, role="user")
+    await _write_chat_turn(ms, message_id="answer", content="CODE-OLD.", turn_number=2, role="assistant")
+    await _drain_write_log(ms)
+    for raw in ms._raw_sessions:
+        if raw.get("message_id") == "answer":
+            raw["status"] = "retracted"
+    for doc in ms._episode_corpus.get("documents", []):
+        for episode in doc.get("episodes", []):
+            if episode.get("message_id") == "answer":
+                episode["status"] = "retracted"
+    ms._bump_index_snapshot_version()
+
+    result = await _recall_as_agent_b(ms, "what did you answer about access code?")
+
+    assert "CODE-OLD" not in result["context"]
+
+
 # ── Tests ──
 
 def test_store_creates_cache_file(tmp_path, monkeypatch):
@@ -1918,6 +2133,14 @@ async def test_completed_zero_fact_assistant_answer_remains_raw_retrievable(tmp_
     assert "COMPLETED RAW EVIDENCE:" in after_worker["context"]
     assert "ZX-91B" in after_worker["context"]
     assert after_worker["completed_raw_recall_count"] == 1
+    raw_items = [
+        item for item in after_worker["retrieved"]
+        if item.get("raw_evidence_kind") == "completed_raw_episode"
+    ]
+    assert raw_items
+    assert "artifact_id" not in raw_items[0]
+    assert "version_id" not in raw_items[0]
+    assert "raw_session_id" not in raw_items[0]
 
     await ms.build_index()
     after_index = await _recall_as_agent_b(ms, "ZX-91B")
@@ -2116,6 +2339,83 @@ async def test_completed_zero_fact_raw_evidence_preserves_acl(tmp_path, monkeypa
         caller_role="agent",
     )
     assert "omega-secret" in authorized["context"]
+
+
+@pytest.mark.asyncio
+async def test_kind_specific_recall_does_not_use_raw_fallback(tmp_path, monkeypatch):
+    async def _extract_session(**kwargs):
+        return ("conv", int(kwargs.get("session_num") or 1), kwargs.get("session_date", "2024-06-01"), [], [])
+
+    _patch_conversation_raw_recall_runtime(monkeypatch, _extract_session)
+    ms = MemoryServer(str(tmp_path), "raw_kind_filter")
+    await _write_chat_turn(
+        ms,
+        message_id="raw-constraint",
+        content="The deployment limit is 7 nodes.",
+        turn_number=1,
+        role="user",
+    )
+    await _drain_write_log(ms)
+
+    kind_specific = await ms.recall(
+        query="deployment limit",
+        agent_id="agent-b",
+        swarm_id="team-gosh",
+        search_family="conversation",
+        query_type="lookup",
+        kind="preference",
+        caller_id="agent:agent-b",
+        caller_memberships=["swarm:team-gosh"],
+        caller_role="agent",
+    )
+    assert "The deployment limit is 7 nodes." not in kind_specific["context"]
+    assert kind_specific["runtime_trace"]["raw_recall"]["skipped"] == "kind_filter"
+
+    all_kind = await _recall_as_agent_b(ms, "deployment limit")
+    assert "The deployment limit is 7 nodes." in all_kind["context"]
+
+
+@pytest.mark.asyncio
+async def test_retract_hides_raw_and_allows_same_content_reingest(tmp_path, monkeypatch):
+    _patch_all(monkeypatch, n_facts=1)
+    ms = MemoryServer(str(tmp_path), "retract_raw_visibility")
+    first = await _store(
+        ms,
+        "User: The launch phrase is silver comet.",
+        1,
+        "2024-06-01",
+        source_id="SRC-RETRACT",
+        artifact_id="artifact-retract-1",
+        version_id="v1",
+    )
+    assert first["status"] == "ok"
+    before = await ms.recall("silver comet", search_family="conversation", query_type="lookup")
+    assert "silver comet" in before["context"]
+
+    retracted = await ms.retract("artifact-retract-1", caller_role="admin")
+    assert retracted["status"] == "retracted"
+    after = await ms.recall("silver comet", search_family="conversation", query_type="lookup")
+    assert "silver comet" not in after["context"]
+
+    second = await _store(
+        ms,
+        "User: The launch phrase is silver comet.",
+        2,
+        "2024-06-02",
+        source_id="SRC-RETRACT-NEW",
+        artifact_id="artifact-retract-2",
+        version_id="v2",
+    )
+    assert second["status"] == "ok"
+    assert second["facts_extracted"] == 1
+    reloaded = MemoryServer(str(tmp_path), "retract_raw_visibility")
+    final = await reloaded.recall("silver comet", search_family="conversation", query_type="lookup")
+    assert "silver comet" in final["context"]
+    assert all(
+        raw.get("status") == "retracted"
+        for raw in reloaded._raw_sessions
+        if raw.get("artifact_id") == "artifact-retract-1"
+    )
 
 
 @pytest.mark.asyncio
@@ -2783,6 +3083,152 @@ def test_codebase_search_family_bypasses_conversation_document_raw_gate(tmp_path
     assert "raw_likely" not in merged.get("runtime_trace", {})
     assert "conversation_raw_window" not in merged.get("runtime_trace", {})
     assert "document_raw_window" not in merged.get("runtime_trace", {})
+
+
+def test_conversation_exact_duplicate_requires_active_extracted_fact(tmp_path):
+    ms = MemoryServer(str(tmp_path), "dedup_requires_fact")
+    content = "User: retry this zero-fact write"
+    ms._index_content_entry(
+        message_id="m-zero",
+        source_id="chat-1",
+        session_num=1,
+        stored_at="2024-06-01T00:00:00+00:00",
+        scope="swarm-shared",
+        owner_id="agent:agent-a",
+        swarm_id="team-gosh",
+        family="conversation",
+        content=content,
+    )
+    ms._raw_sessions = [{
+        "raw_session_id": "rs-zero",
+        "message_id": "m-zero",
+        "status": "active",
+    }]
+
+    assert ms._find_exact_duplicate(
+        content=content,
+        family="conversation",
+        scope="swarm-shared",
+        owner_id="agent:agent-a",
+        swarm_id="team-gosh",
+    ) is None
+
+    ms._all_granular = [{"raw_session_id": "rs-zero", "status": "active"}]
+    duplicate = ms._find_exact_duplicate(
+        content=content,
+        family="conversation",
+        scope="swarm-shared",
+        owner_id="agent:agent-a",
+        swarm_id="team-gosh",
+    )
+    assert duplicate["message_id"] == "m-zero"
+
+    ms._all_granular[0]["status"] = "retracted"
+    assert ms._find_exact_duplicate(
+        content=content,
+        family="conversation",
+        scope="swarm-shared",
+        owner_id="agent:agent-a",
+        swarm_id="team-gosh",
+    ) is None
+
+
+def test_empty_fact_raw_fallback_requires_explicit_empty_visible_reason(tmp_path):
+    ms = MemoryServer(str(tmp_path), "raw_empty_reason_gate")
+    ms._raw_sessions = [{
+        "raw_session_id": "rs-fallback",
+        "message_id": "m-fallback",
+        "session_id": "chat-1",
+        "content": "User account code is FALLBACK-44.",
+        "format": "conversation",
+        "content_family": "chat",
+        "session_num": 1,
+        "projection_session_num": 1,
+        "session_date": "2024-06-01",
+        "status": "active",
+        "metadata": {"role": "assistant", "turn_number": "1"},
+        "agent_id": "agent-a",
+        "swarm_id": "team-gosh",
+        "scope": "swarm-shared",
+        "owner_id": "agent:agent-a",
+        "read": ["swarm:team-gosh"],
+        "write": ["swarm:team-gosh"],
+    }]
+    base_result = {
+        "context": "",
+        "retrieved": [],
+        "search_family": "conversation",
+        "retrieval_families": ["conversation"],
+        "query_type": "lookup",
+        "runtime_trace": {},
+    }
+    kwargs = {
+        "query": "what is my account code?",
+        "caller_id": "agent:agent-b",
+        "caller_memberships": ["swarm:team-gosh"],
+        "caller_role": "agent",
+        "swarm_id": "team-gosh",
+    }
+
+    without_reason = ms._merge_raw_recall(result=deepcopy(base_result), **kwargs)
+    assert "FALLBACK-44" not in without_reason.get("context", "")
+    assert without_reason.get("raw_recall_count", 0) == 0
+
+    with_reason_result = deepcopy(base_result)
+    with_reason_result["runtime_trace"] = {"reason": "empty_visible_facts"}
+    with_reason = ms._merge_raw_recall(result=with_reason_result, **kwargs)
+    assert "FALLBACK-44" in with_reason["context"]
+    assert with_reason["raw_recall_count"] == 1
+    assert with_reason["runtime_trace"]["raw_episode_retrieval"]["empty_fact_fallback"] is True
+
+
+@pytest.mark.asyncio
+async def test_kind_filtered_recall_does_not_merge_raw_evidence(tmp_path, monkeypatch):
+    async def _extract_session(**kwargs):
+        return ("conv", int(kwargs.get("session_num") or 1), kwargs.get("session_date", "2024-06-01"), [], [])
+
+    _patch_conversation_raw_recall_runtime(monkeypatch, _extract_session)
+    ms = MemoryServer(str(tmp_path), "kind_filtered_raw")
+    await _write_chat_turn(
+        ms,
+        message_id="raw-constraint",
+        content="The deployment constraint is RAW-ONLY-771.",
+        turn_number=1,
+        role="assistant",
+    )
+    await _drain_write_log(ms)
+
+    result = await _recall_as_agent_b(ms, "RAW-ONLY-771", kind="preference")
+    assert "RAW-ONLY-771" not in result.get("context", "")
+    assert result.get("raw_recall_count", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_retracted_completed_raw_evidence_is_not_returned(tmp_path, monkeypatch):
+    async def _extract_session(**kwargs):
+        return ("conv", int(kwargs.get("session_num") or 1), kwargs.get("session_date", "2024-06-01"), [], [])
+
+    _patch_conversation_raw_recall_runtime(monkeypatch, _extract_session)
+    ms = MemoryServer(str(tmp_path), "raw_retract_visibility")
+    await _write_chat_turn(
+        ms,
+        message_id="raw-answer",
+        content="The temporary answer is RETRACT-ME-42.",
+        turn_number=1,
+        role="assistant",
+    )
+    await _drain_write_log(ms)
+
+    before = await _recall_as_agent_b(ms, "RETRACT-ME-42")
+    assert "RETRACT-ME-42" in before["context"]
+
+    artifact_id = next(raw["artifact_id"] for raw in ms._raw_sessions if raw.get("message_id") == "raw-answer")
+    retracted = await ms.retract(artifact_id, caller_role="admin")
+    assert retracted["status"] == "retracted"
+
+    after = await _recall_as_agent_b(ms, "RETRACT-ME-42")
+    assert "RETRACT-ME-42" not in after.get("context", "")
+    assert after.get("raw_recall_count", 0) == 0
 
 
 @pytest.mark.asyncio
@@ -3570,13 +4016,6 @@ async def test_admin_mcp_backfill_original_raw_sources_requires_admin_and_rebuil
     assert "admin backfill’s exact line" in render_refs[0]["ref_json"]["text"]
 
 
-def test_mrcr_backfill_wrapper_only_classifies_sqlcipher_runtime_errors():
-    from scripts.backfill_mrcr_cache_raw_sources import _is_sqlcipher_unavailable
-
-    assert _is_sqlcipher_unavailable(RuntimeError("pysqlcipher3 module is not installed"))
-    assert not _is_sqlcipher_unavailable(RuntimeError("schema migration failed"))
-
-
 @pytest.mark.asyncio
 async def test_admin_mcp_backfill_authorizes_before_loading_memory(monkeypatch):
     import src.mcp_server as mcp_mod
@@ -3593,69 +4032,6 @@ async def test_admin_mcp_backfill_authorizes_before_loading_memory(monkeypatch):
     )
 
     assert result["code"] == "AUTH_REQUIRED"
-
-
-def test_generic_mcp_backfill_tool_requires_manifest_not_cache_root(tmp_path, monkeypatch, capsys):
-    from scripts.backfill_raw_sources_via_mcp import main as wrapper_main
-
-    monkeypatch.setattr(
-        "sys.argv",
-        [
-            "backfill",
-            "--cache-root",
-            str(tmp_path),
-            "--endpoint",
-            "http://127.0.0.1:9",
-            "--key",
-            "current",
-            "--admin-token",
-            "admin-token",
-        ],
-    )
-
-    with pytest.raises(SystemExit) as exc:
-        wrapper_main()
-
-    assert exc.value.code == 2
-    assert "manifest" in capsys.readouterr().err.lower()
-
-
-def test_generic_mcp_backfill_wrapper_exits_nonzero_on_tool_failure(tmp_path, monkeypatch, capsys):
-    import scripts.backfill_raw_sources_via_mcp as wrapper
-
-    manifest = tmp_path / "raw_manifest.json"
-    manifest.write_text(
-        json.dumps({"sources": [{"source_id": "src-1", "original_content": "raw", "content_kind": "original_source"}]}),
-        encoding="utf-8",
-    )
-
-    monkeypatch.setattr(
-        wrapper,
-        "_tool_call",
-        lambda *_args, **_kwargs: {"status": "ok", "missing": ["src-1"], "refused": [], "validation": {"ok": False}},
-    )
-    monkeypatch.setattr(
-        "sys.argv",
-        [
-            "backfill",
-            "--manifest",
-            str(manifest),
-            "--endpoint",
-            "http://127.0.0.1:9",
-            "--key",
-            "current",
-            "--admin-token",
-            "admin-token",
-        ],
-    )
-
-    exit_code = wrapper.main()
-    output = json.loads(capsys.readouterr().out)
-
-    assert exit_code == 1
-    assert output["status"] == "BACKFILL_FAILED"
-    assert output["BACKFILL_PATH"] == "memory_admin_api"
-    assert output["EXPECTED_ANSWERS_READ"] is False
 
 
 def test_augment_commonality_facts_prefers_interest_pairs_over_event_pairs():
@@ -3797,6 +4173,141 @@ def test_document_structural_packet_can_use_cross_only_substrate_facts(tmp_path)
     assert any(fact["id"] == "substrate_permit_record" for fact in retrieved)
     assert "substrate_permit_record" in augmented_packet["retrieved_fact_ids"]
     assert "Permit T-17 was approved on 2026-02-12." in augmented_packet["context"]
+
+
+def test_mark_tiers_dirty_keeps_only_current_supported_doc_cross_facts(tmp_path):
+    ms = MemoryServer(str(tmp_path), "doc_cross_lifecycle")
+    ms._source_records["DOC-LIFE"] = {
+        "family": "document",
+        "artifact_id": "artifact-new",
+        "version_id": "v2",
+    }
+    ms._all_granular = [{
+        "id": "doc-fact-new",
+        "fact": "Current document fact.",
+        "source_id": "DOC-LIFE",
+        "artifact_id": "artifact-new",
+        "version_id": "v2",
+        "status": "active",
+    }]
+    ms._all_cross = [
+        {
+            "id": "old-cross",
+            "fact": "Old stale cross.",
+            "source_id": "DOC-LIFE",
+            "artifact_id": "artifact-old",
+            "version_id": "v1",
+            "status": "active",
+            "metadata": {"source_aggregation": True, "source_id": "DOC-LIFE"},
+        },
+        {
+            "id": "new-cross",
+            "fact": "Current supported cross.",
+            "source_id": "DOC-LIFE",
+            "artifact_id": "artifact-new",
+            "version_id": "v2",
+            "status": "active",
+            "metadata": {"source_aggregation": True, "source_id": "DOC-LIFE"},
+        },
+        {
+            "id": "legacy-unversioned-cross",
+            "fact": "Legacy unversioned cross.",
+            "source_id": "DOC-LIFE",
+            "status": "active",
+            "metadata": {"source_aggregation": True, "source_id": "DOC-LIFE"},
+        },
+        {
+            "id": "unsupported-cross",
+            "fact": "Unsupported cross.",
+            "source_id": "DOC-MISSING",
+            "status": "active",
+            "metadata": {"source_aggregation": True, "source_id": "DOC-MISSING"},
+        },
+        {
+            "id": "asserted-cross",
+            "fact": "Asserted derived cross.",
+            "status": "active",
+            "metadata": {"asserted_derived_tier": True},
+        },
+    ]
+
+    ms._mark_tiers_dirty()
+
+    assert [fact["id"] for fact in ms._all_cross] == ["new-cross", "asserted-cross"]
+
+
+def test_reload_runtime_from_storage_drops_stale_doc_cross_facts(tmp_path):
+    class StorageStub:
+        exists = True
+
+        def load_facts(self, *, internal=False):
+            assert internal is True
+            return {
+                "granular": [{
+                    "id": "doc-fact-new",
+                    "fact": "Current document fact.",
+                    "source_id": "DOC-RELOAD",
+                    "artifact_id": "artifact-new",
+                    "version_id": "v2",
+                    "status": "active",
+                }],
+                "cons": [],
+                "cross": [
+                    {
+                        "id": "old-cross",
+                        "fact": "Old stale cross.",
+                        "source_id": "DOC-RELOAD",
+                        "artifact_id": "artifact-old",
+                        "version_id": "v1",
+                        "status": "active",
+                        "metadata": {"source_aggregation": True, "source_id": "DOC-RELOAD"},
+                    },
+                    {
+                        "id": "legacy-unversioned-cross",
+                        "fact": "Legacy unversioned cross.",
+                        "source_id": "DOC-RELOAD",
+                        "status": "active",
+                        "metadata": {"source_aggregation": True, "source_id": "DOC-RELOAD"},
+                    },
+                    {
+                        "id": "new-cross",
+                        "fact": "Current supported cross.",
+                        "source_id": "DOC-RELOAD",
+                        "artifact_id": "artifact-new",
+                        "version_id": "v2",
+                        "status": "active",
+                        "metadata": {"source_aggregation": True, "source_id": "DOC-RELOAD"},
+                    },
+                    {
+                        "id": "asserted-cross",
+                        "fact": "Asserted derived cross.",
+                        "status": "active",
+                        "metadata": {"asserted_derived_tier": True},
+                    },
+                ],
+                "tlinks": [],
+                "raw_sessions": [],
+                "raw_docs": {},
+                "episode_corpus": {"documents": []},
+                "container_graph": {},
+                "source_records": {
+                    "DOC-RELOAD": {
+                        "family": "document",
+                        "artifact_id": "artifact-new",
+                        "version_id": "v2",
+                    }
+                },
+                "n_sessions": 1,
+                "n_sessions_with_facts": 1,
+            }
+
+    ms = MemoryServer(str(tmp_path), "doc_cross_reload")
+    ms._storage = StorageStub()
+
+    ms._reload_runtime_from_storage()
+
+    assert [fact["id"] for fact in ms._all_cross] == ["new-cross", "asserted-cross"]
+
 
 @pytest.mark.asyncio
 async def test_temporal_recall_prefers_semantic_temporal_fact_over_conflicting_granular(tmp_path, monkeypatch):

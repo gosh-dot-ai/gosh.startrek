@@ -76,7 +76,11 @@ def _patch_document_extract(monkeypatch):
             "metadata": {"source_aggregation": True},
         }]
 
+    async def mock_group_document(model, source_id, title, source_date, block_dicts, grouping_config, sem):
+        return memory_mod.build_singleton_episodes(source_id, source_date, block_dicts), {"mode": "singleton"}, "singleton"
+
     monkeypatch.setattr("src.memory.extract_session", mock_extract_session)
+    monkeypatch.setattr("src.memory.group_document", mock_group_document)
     monkeypatch.setattr(MemoryServer, "_extract_source_aggregation_facts", mock_extract_source_aggregation_facts)
 
 
@@ -163,6 +167,38 @@ async def test_ingest_document_propagates_target_to_derived_tiers(tmp_path, monk
     assert all(f.get("target") == ["agent:planner"] for f in ms._all_granular)
     assert ms._all_cons == []
     assert all(f.get("target") == ["agent:planner"] for f in ms._all_cross)
+
+
+@pytest.mark.asyncio
+async def test_ingest_document_purges_stale_derived_tiers_but_keeps_fresh_source_aggregation(tmp_path, monkeypatch):
+    _patch_document_extract(monkeypatch)
+    ms = MemoryServer(str(tmp_path), "doc_meta_derived_purge")
+    ms._all_cons.append({
+        "id": "stale_cons",
+        "fact": "Stale consolidated fact",
+        "kind": "summary",
+        "status": "active",
+    })
+    ms._all_cross.append({
+        "id": "stale_cross",
+        "fact": "Stale cross fact",
+        "kind": "fact",
+        "status": "active",
+    })
+
+    result = await ms.ingest_document(
+        content="Document body",
+        source_id="DOC-PURGE",
+        scope="agent-private",
+        target="agent:planner",
+    )
+
+    assert result["facts_extracted"] == 1
+    cross_ids = {fact["id"] for fact in ms._all_cross}
+    cons_ids = {fact["id"] for fact in ms._all_cons}
+    assert "stale_cross" not in cross_ids
+    assert "stale_cons" not in cons_ids
+    assert "substrate_DOC-PURGE_substrate_spec" in cross_ids
 
 
 @pytest.mark.asyncio

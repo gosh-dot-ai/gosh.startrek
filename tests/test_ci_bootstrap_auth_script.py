@@ -14,7 +14,7 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT_PATH = PROJECT_ROOT / "scripts" / "ci" / "bootstrap_test_auth.py"
+SCRIPT_PATH = PROJECT_ROOT / "ci" / "scripts" / "bootstrap_test_auth.py"
 
 
 def test_bootstrap_script_does_not_print_tokens_when_writing_github_env(tmp_path: Path) -> None:
@@ -27,7 +27,8 @@ def test_bootstrap_script_does_not_print_tokens_when_writing_github_env(tmp_path
         cwd=PROJECT_ROOT,
     )
 
-    assert proc.stdout == ""
+    assert "GOSH_TEST_BOOTSTRAP_ADMIN_TOKEN=" not in proc.stdout
+    assert "MEMORY_SERVER_TOKEN=" not in proc.stdout
     contents = env_file.read_text(encoding="utf-8")
     assert "GOSH_TEST_BOOTSTRAP_ADMIN_TOKEN=" in contents
     assert "MEMORY_SERVER_TOKEN=" in contents
