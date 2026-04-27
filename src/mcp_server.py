@@ -10,6 +10,7 @@
 import argparse
 import asyncio
 import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -37,6 +38,57 @@ from src.memory import MemoryServer, _is_visible, _normalize_identity
 from src.storage import SQLiteAuthorityStorage, migrate_jsonnpz_to_sqlite
 
 log = logging.getLogger(__name__)
+STARTUP_LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
+
+
+def token_fingerprint(token: str) -> str:
+    digest = hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
+    return f"sha256:{digest[:12]}"
+
+
+def configure_startup_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format=STARTUP_LOG_FORMAT,
+    )
+
+
+def startup_log_lines(
+    *,
+    title: str,
+    listening: str,
+    data_dir: str | None = None,
+    embeddings: str | None = None,
+    tls: str | None = None,
+    token: str,
+    token_path: str | Path,
+    summary: str | None = None,
+) -> list[str]:
+    header = title if summary is None else f"{title} — {summary}"
+    lines = [
+        header,
+        f"Listening: {listening}",
+    ]
+    if data_dir is not None:
+        lines.append(f"Data dir: {data_dir}")
+    if embeddings is not None:
+        lines.append(f"Embeddings: {embeddings}")
+    if tls is not None:
+        lines.append(f"TLS: {tls}")
+    lines.extend([
+        "POST /mcp — MCP tool calls",
+        "GET /mcp/sse — Courier SSE stream",
+        f"Token fingerprint: {token_fingerprint(token)}",
+        f"Token saved to: {token_path}",
+    ])
+    return lines
+
+
+def log_startup_lines(lines: list[str]) -> None:
+    configure_startup_logging()
+    startup_log = logging.getLogger("gosh.memory.startup")
+    for line in lines:
+        startup_log.info("%s", line)
 
 
 def _safe_tool(fn):
@@ -830,11 +882,77 @@ async def memory_write_status(
 
 
 
+def _public_recall_continuation(continuation: dict | None) -> dict | None:
+    if not isinstance(continuation, dict):
+        return None
+    public = deepcopy(continuation)
+    if public.get("available"):
+        public["tool"] = "memory_recall"
+        public["mcp_tool"] = "memory_recall"
+        public["tool_usage"] = (
+            "call memory_recall with continuation_handle=<handle> and page=\"next\" "
+            "to fetch the next evidence page"
+        )
+    return public
+
+
+def _public_recall_continuation_instruction(handle: str | None = None) -> str:
+    handle_text = "<handle>"
+    if handle:
+        handle_text = str(handle)
+    return (
+        "call memory_recall with continuation_handle="
+        f"\"{handle_text}\" and page=\"next\" to fetch the next evidence page"
+    )
+
+
+def _public_recall_context(context: str, continuation: dict | None) -> str:
+    if not isinstance(continuation, dict) or not continuation.get("available"):
+        return str(context or "")
+    handle = str(continuation.get("handle") or "")
+    text = str(context or "")
+    replacements = {
+        "call get_more_context with page=\"next\" or without session_id to retrieve the next evidence page":
+            _public_recall_continuation_instruction(handle).replace("fetch", "retrieve"),
+        "call get_more_context with page=\"next\" or without session_id to fetch the next evidence page":
+            _public_recall_continuation_instruction(handle),
+        "call get_more_context with page=\"next\" or no session_id to fetch the next page":
+            _public_recall_continuation_instruction(handle).replace("evidence page", "page"),
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return text
+
+
+def _public_answer_contract(contract: dict | None) -> dict | None:
+    if not isinstance(contract, dict):
+        return None
+    public = deepcopy(contract)
+    continuation = public.get("recall_continuation")
+    if isinstance(continuation, dict) and continuation.get("available"):
+        handle = str(continuation.get("handle") or "")
+        continuation["tool"] = "memory_recall"
+        continuation["mcp_tool"] = "memory_recall"
+        continuation["instruction"] = (
+            "The returned context is the first evidence page. If the answer is not present "
+            "and more evidence is available, "
+            f"{_public_recall_continuation_instruction(handle)}."
+        )
+        public["recall_continuation"] = continuation
+        prompt_template = public.get("prompt_template")
+        if isinstance(prompt_template, str):
+            public["prompt_template"] = _public_recall_context(prompt_template, continuation).replace(
+                "get_more_context",
+                "memory_recall",
+            )
+    return public
+
+
 @mcp.tool(name="memory_recall")
 @_safe_tool
 async def memory_recall(
     key: str,
-    query: str,
+    query: str = "",
     agent_id: str = "default",
     swarm_id: str = "default",
     search_family: str = "auto",
@@ -842,6 +960,8 @@ async def memory_recall(
     query_type: str = "auto",
     kind: str = "all",
     query_metadata: dict | None = None,
+    continuation_handle: str | None = None,
+    page: int | str | None = None,
     token: str = None,
     agent_key: str = None,
 ) -> dict:
@@ -867,6 +987,11 @@ async def memory_recall(
     callers answer from recall evidence with the same prompt leaf memory_ask
     uses internally. Provider payloads, profile choices, and secret refs remain
     outside memory_recall.
+
+    If a response includes recall_continuation.available=true, fetch later
+    evidence pages by calling memory_recall again with continuation_handle and
+    page="next". This is the public MCP paging path; get_more_context is only an
+    internal inference tool used by memory_ask payloads.
 
     Do not generate code changes from absent evidence. If repeated focused
     recall calls cannot provide the required evidence, report the precise
@@ -908,6 +1033,37 @@ async def memory_recall(
         return denied
     _memberships = _ctx_memberships(ictx)
     mal_binding_id = _resolve_mal_binding_id(ictx, agent_id)
+    if continuation_handle:
+        result = server.recall_continuation_page(
+            continuation_handle=continuation_handle,
+            page=page or "next",
+            caller_id=ictx.owner_id,
+            caller_memberships=_memberships,
+            caller_role=ictx.caller_role,
+            swarm_id=swarm_id,
+        )
+        if result.get("error") or result.get("code"):
+            return {
+                "error": result.get("error", "Recall continuation failed"),
+                "code": result.get("code", "RECALL_CONTINUATION_ERROR"),
+                "recall_continuation": _public_recall_continuation(result.get("recall_continuation")) or {},
+            }
+        continuation = _public_recall_continuation(result.get("recall_continuation")) or {}
+        context = _public_recall_context(str(result.get("context") or ""), continuation)
+        return {
+            "telemetry_version": 1,
+            "context": context,
+            "retrieved_count": 0,
+            "query_type": result.get("query_type", "continuation"),
+            "token_estimate": len(context) // 4,
+            "sessions_in_context": 0,
+            "total_sessions": 0,
+            "coverage_pct": 0,
+            "recall_continuation": continuation,
+            "runtime_trace": result.get("runtime_trace", {}),
+        }
+    if not str(query or "").strip():
+        return {"error": "query is required unless continuation_handle is provided", "code": "MISSING_QUERY"}
     try:
         result = await server.recall(
             query=query,
@@ -927,6 +1083,13 @@ async def memory_recall(
         import traceback
         log.error("memory_recall error:\n%s", traceback.format_exc())
         return {"error": str(e), "code": "RECALL_ERROR"}
+    server._remember_recall_continuation(
+        result,
+        caller_id=ictx.owner_id,
+        caller_memberships=_memberships,
+        caller_role=ictx.caller_role,
+        swarm_id=swarm_id,
+    )
     for inference_field in ("recommended_profile", "payload", "payload_meta", "_payload_secret_ref", "secret_ref"):
         result.pop(inference_field, None)
     if result.get("error") or result.get("code") or "context" not in result:
@@ -938,19 +1101,23 @@ async def memory_recall(
         if "runtime_trace" in result:
             resp["runtime_trace"] = result["runtime_trace"]
         return resp
+    result_context = _public_recall_context(
+        str(result.get("context") or ""),
+        result.get("recall_continuation"),
+    )
     max_chars = token_budget * 4
-    if len(result.get("context", "")) > max_chars:
-        result["context"] = result["context"][:max_chars] + "\n[...truncated]"
+    if len(result_context) > max_chars:
+        result_context = result_context[:max_chars] + "\n[...truncated]"
     default_hint = {
         "score": 0.0, "level": 1, "signals": [],
         "retrieval_complexity": 0.0, "content_complexity": 0.0, "dominant": "tie",
     }
     resp = {
         "telemetry_version": 1,
-        "context": result["context"],
+        "context": result_context,
         "retrieved_count": len(result.get("retrieved", [])),
         "query_type": result.get("query_type", "default"),
-        "token_estimate": len(result.get("context", "")) // 4,
+        "token_estimate": len(result_context) // 4,
         "complexity_hint": result.get("complexity_hint", default_hint),
         "sessions_in_context": result.get("sessions_in_context", 0),
         "total_sessions": result.get("total_sessions", 0),
@@ -962,7 +1129,7 @@ async def memory_recall(
     if "search_family" in result:
         resp["search_family"] = result["search_family"]
     if "answer_contract" in result:
-        resp["answer_contract"] = result["answer_contract"]
+        resp["answer_contract"] = _public_answer_contract(result["answer_contract"])
     if "terminal_render_candidate" in result:
         resp["terminal_render_candidate"] = _sanitize_terminal_render_candidate(
             deepcopy(result["terminal_render_candidate"])
@@ -979,6 +1146,8 @@ async def memory_recall(
         resp["repo_task_context_packs"] = result["repo_task_context_packs"]
     if "raw_recall_count" in result:
         resp["raw_recall_count"] = result["raw_recall_count"]
+    if "recall_continuation" in result:
+        resp["recall_continuation"] = _public_recall_continuation(result["recall_continuation"])
     return resp
 
 
@@ -3584,12 +3753,13 @@ if __name__ == "__main__":
     except Exception:
         _embed_prov, _embed_mod = "openai", "text-embedding-3-large"
 
-    print(f"GOSH Memory MCP Server — {app_cfg.summary()}")
-    print(f"Listening on http://{args.host}:{args.port}")
-    print(f"  Embeddings:   {_embed_prov} / {_embed_mod}")
-    print("  POST /mcp     → MCP tool calls")
-    print("  GET  /mcp/sse → Courier SSE stream")
-    print(f"Server token: {SERVER_TOKEN}")
-    print(f"Token saved to: {token_path}")
+    log_startup_lines(startup_log_lines(
+        title="GOSH Memory MCP Server",
+        summary=app_cfg.summary(),
+        listening=f"http://{args.host}:{args.port}",
+        embeddings=f"{_embed_prov} / {_embed_mod}",
+        token=SERVER_TOKEN,
+        token_path=token_path,
+    ))
 
     uvicorn.run(app, host=args.host, port=args.port)

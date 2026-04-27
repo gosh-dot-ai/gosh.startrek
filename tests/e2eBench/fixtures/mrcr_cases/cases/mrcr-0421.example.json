@@ -1,6 +1,6 @@
 {
   "example_id": "mrcr-0421",
-  "benchmark_id": "mrcr_v2_r1776370194_mrcr-0421",
+  "benchmark_key": "mrcr_v2_r1776370194_mrcr-0421",
   "query": {
     "id": "mrcr-0421",
     "query": "Prepend SAwvzK1zAw to the 2nd (1 indexed) short scene in a play about mothers. Do not include any other text in your response.",

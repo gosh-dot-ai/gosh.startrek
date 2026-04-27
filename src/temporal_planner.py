@@ -57,16 +57,47 @@ CALENDAR_TEXT_DATE_RE = re.compile(
 )
 CALENDAR_YEAR_RE = re.compile(r"\bin\s+\d{4}\b", re.I)
 CALENDAR_RELATIVE_RE = re.compile(
-    r"\b(?:\d+\s+(?:years?|months?|weeks?)\s+ago|last\s+(?:week|month|year)|for\s+\d+\s+(?:years?|months?|weeks?))\b",
+    r"\b(?:"
+    r"\d+\s+(?:years?|months?|weeks?|days?)\s+ago|"
+    r"(?:in\s+)?\d+\s+(?:years?|months?|weeks?|days?)\s+(?:from\s+now|later)|"
+    r"in\s+\d+\s+(?:years?|months?|weeks?|days?)|"
+    r"(?:today|tonight|tomorrow|yesterday|last\s+night)|"
+    r"(?:next|this|last)\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|week|month|year)|"
+    r"last\s+(?:week|month|year)|for\s+\d+\s+(?:years?|months?|weeks?)"
+    r")\b",
     re.I,
 )
-AGO_RE = re.compile(r"\b(\d+)\s+(years?|months?|weeks?)\s+ago\b", re.I)
+AGO_RE = re.compile(r"\b(\d+)\s+(years?|months?|weeks?|days?)\s+ago\b", re.I)
+FUTURE_OFFSET_RE = re.compile(
+    r"\b(?:in\s+)?(\d+)\s+(days?|weeks?|months?|years?)\s+(?:from\s+now|later)\b"
+    r"|\bin\s+(\d+)\s+(days?|weeks?|months?|years?)\b",
+    re.I,
+)
 LAST_RE = re.compile(r"\blast\s+(week|month|year)\b", re.I)
 FOR_RE = re.compile(r"\bfor\s+(\d+)\s+(years?|months?|weeks?)\b", re.I)
+DEICTIC_RE = re.compile(r"\b(today|tonight|tomorrow|yesterday|last\s+night)\b", re.I)
+WEEKDAY_RE = re.compile(
+    r"\b(next|this|last)\s+"
+    r"(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+    re.I,
+)
+SCHEDULE_SEEKING_RE = re.compile(
+    r"^\s*(?:"
+    r"when\s+(?:should|will|is|are|was|were)\b|"
+    r"what\s+(?:date|time)\s+(?:is|are|was|were|should|will)\b"
+    r")",
+    re.I,
+)
+SCHEDULE_EVENT_RE = re.compile(
+    r"\b(?:planned|scheduled|due|expected|going\s+to|happen|launch|release|go\s+live|start|end)\b",
+    re.I,
+)
 CALENDAR_SEEKING_PREFIX_RULES = (
     (re.compile(r"^\s*when did\b", re.I), "date"),
     (re.compile(r"^\s*when was\b", re.I), "date"),
     (re.compile(r"^\s*when is\b", re.I), "date"),
+    (re.compile(r"^\s*when should\b", re.I), "date"),
+    (re.compile(r"^\s*when will\b", re.I), "date"),
     (re.compile(r"^\s*what year\b", re.I), "year"),
     (re.compile(r"^\s*which year\b", re.I), "year"),
     (re.compile(r"^\s*what month\b", re.I), "month"),
@@ -199,11 +230,49 @@ def _iso_date(dt: datetime) -> str:
 
 def _approx_shift(anchor: datetime, amount: int, unit: str) -> datetime:
     unit = unit.lower()
+    if unit.startswith("day"):
+        return anchor - timedelta(days=amount)
     if unit.startswith("week"):
         return anchor - timedelta(weeks=amount)
     if unit.startswith("month"):
         return anchor - timedelta(days=30 * amount)
     return anchor - timedelta(days=365 * amount)
+
+
+def _approx_shift_future(anchor: datetime, amount: int, unit: str) -> datetime:
+    unit = unit.lower()
+    if unit.startswith("day"):
+        return anchor + timedelta(days=amount)
+    if unit.startswith("week"):
+        return anchor + timedelta(weeks=amount)
+    if unit.startswith("month"):
+        return anchor + timedelta(days=30 * amount)
+    return anchor + timedelta(days=365 * amount)
+
+
+def _weekday_index(name: str) -> int:
+    return {
+        "monday": 0,
+        "tuesday": 1,
+        "wednesday": 2,
+        "thursday": 3,
+        "friday": 4,
+        "saturday": 5,
+        "sunday": 6,
+    }[name.lower()]
+
+
+def _resolve_relative_weekday(anchor: datetime, direction: str, weekday: str) -> datetime:
+    target = _weekday_index(weekday)
+    current = anchor.weekday()
+    direction = direction.lower()
+    if direction == "last":
+        delta = (current - target) % 7 or 7
+        return anchor - timedelta(days=delta)
+    delta = (target - current) % 7
+    if direction == "next" and delta == 0:
+        delta = 7
+    return anchor + timedelta(days=delta)
 
 
 def classify_temporal_query(question: str) -> str:
@@ -310,7 +379,12 @@ def extract_calendar_query(question: str) -> dict | None:
         if not match:
             continue
         content_query = text[match.end():].strip(" \t:-,?.!")
-        content_query = re.sub(r"^(?:did|was|is|were|are|has|have|had)\b\s*", "", content_query, flags=re.I)
+        content_query = re.sub(
+            r"^(?:did|was|is|were|are|has|have|had|should|will)\b\s*",
+            "",
+            content_query,
+            flags=re.I,
+        )
         if not content_query:
             return None
         return {
@@ -319,6 +393,26 @@ def extract_calendar_query(question: str) -> dict | None:
             "content_query": content_query,
             "prefix": match.group(0).strip().lower(),
         }
+    if SCHEDULE_SEEKING_RE.search(text) and SCHEDULE_EVENT_RE.search(text):
+        content_query = re.sub(
+            r"^\s*(?:when|what\s+(?:date|time))\s+",
+            "",
+            text,
+            flags=re.I,
+        )
+        content_query = re.sub(
+            r"^(?:did|was|is|were|are|has|have|had|should|will)\b\s*",
+            "",
+            content_query,
+            flags=re.I,
+        ).strip(" \t:-,?.!")
+        if content_query:
+            return {
+                "mode": "seeking",
+                "granularity": "date",
+                "content_query": content_query,
+                "prefix": "schedule",
+            }
     if (
         CALENDAR_EXACT_DATE_RE.search(text)
         or CALENDAR_TEXT_DATE_RE.search(text)
@@ -379,6 +473,51 @@ def resolve_calendar_query_interval(
             "time_granularity": "year",
         }
     anchor = _parse_anchor_datetime(anchor_timestamp)
+    deictic_match = DEICTIC_RE.search(text)
+    if deictic_match and anchor is not None:
+        raw = deictic_match.group(0)
+        normalized = re.sub(r"\s+", " ", raw.lower()).strip()
+        if normalized in {"today", "tonight"}:
+            resolved = anchor
+        elif normalized == "tomorrow":
+            resolved = anchor + timedelta(days=1)
+        elif normalized in {"yesterday", "last night"}:
+            resolved = anchor - timedelta(days=1)
+        else:
+            resolved = anchor
+        date_str = _iso_date(resolved)
+        return {
+            "time_raw": raw,
+            "time_kind": "point",
+            "time_start": date_str,
+            "time_end": date_str,
+            "time_granularity": "day",
+        }
+    future_match = FUTURE_OFFSET_RE.search(text)
+    if future_match and anchor is not None:
+        amount = int(future_match.group(1) or future_match.group(3))
+        unit = future_match.group(2) or future_match.group(4)
+        resolved = _approx_shift_future(anchor, amount, unit)
+        date_str = _iso_date(resolved)
+        granularity = "year" if unit.lower().startswith("year") else "month" if unit.lower().startswith("month") else "day"
+        return {
+            "time_raw": future_match.group(0),
+            "time_kind": "point",
+            "time_start": date_str,
+            "time_end": date_str,
+            "time_granularity": granularity,
+        }
+    weekday_match = WEEKDAY_RE.search(text)
+    if weekday_match and anchor is not None:
+        resolved = _resolve_relative_weekday(anchor, weekday_match.group(1), weekday_match.group(2))
+        date_str = _iso_date(resolved)
+        return {
+            "time_raw": weekday_match.group(0),
+            "time_kind": "point",
+            "time_start": date_str,
+            "time_end": date_str,
+            "time_granularity": "day",
+        }
     match = CALENDAR_RELATIVE_RE.search(text)
     if not match or anchor is None:
         return None

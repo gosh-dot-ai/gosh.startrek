@@ -235,7 +235,6 @@ class TestMALProductionLoop:
             return (
                 {"model": "test-model", "messages": [{"role": "user", "content": "test"}]},
                 {"profile_used": "test", "use_tool": False},
-                None,
             )
         monkeypatch.setattr(ms, "_build_payload", mock_build_payload)
 
@@ -711,7 +710,6 @@ class TestMALRuntimeWiring:
             return (
                 {"model": "test-model", "messages": [{"role": "user", "content": "test"}]},
                 {"profile_used": "test", "use_tool": False},
-                None,
             )
 
         monkeypatch.setattr(ms, "_build_payload", _mock_build_payload)

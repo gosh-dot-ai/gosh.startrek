@@ -79,23 +79,92 @@ COUNTING_TOOLS = [
 
 GET_CONTEXT_TOOL = {
     "name": "get_more_context",
-    "description": "Retrieve full raw text of a specific session. Use ONLY if facts and raw context don't contain enough detail.",
+    "description": (
+        "Retrieve full raw text of a specific session, or the next recall evidence page. "
+        "Use ONLY if facts and raw context don't contain enough detail. "
+        "If recall says more evidence is available, call without session_id or with page=\"next\"."
+    ),
     "input_schema": {
         "type": "object",
         "properties": {
-            "session_id": {"type": "integer", "description": "Session number (e.g. 12 for S12)"}
+            "session_id": {
+                "type": "integer",
+                "description": "Session number (e.g. 12 for S12). Omit to request recall continuation.",
+            },
+            "page": {
+                "type": ["integer", "string"],
+                "description": "Recall continuation page number or \"next\".",
+            },
+            "continuation_handle": {
+                "type": "string",
+                "description": "Opaque handle from memory_recall.recall_continuation when provided.",
+            },
         },
-        "required": ["session_id"]
+        "required": []
     }
 }
 
 
-def get_more_context(session_id: int, raw_sessions: list = None) -> dict:
-    """Return full text of a session. Truncated at 15K chars. (Unit 9, run_23p.py)"""
+def get_more_context(
+    session_id: int | None = None,
+    raw_sessions: list = None,
+    page: int | str | None = None,
+    continuation_handle: str | None = None,
+    recall_continuation_pages: list | None = None,
+    recall_continuation_handle: str | None = None,
+    continuation_state: dict | None = None,
+) -> dict:
+    """Return full text of a session or a recall continuation page."""
     if raw_sessions is None:
         raw_sessions = []
-    if 0 < session_id <= len(raw_sessions):
-        rs = raw_sessions[session_id - 1]
+    continuation_requested = (
+        session_id in (None, "")
+        or page not in (None, "")
+        or bool(continuation_handle)
+        or bool(recall_continuation_pages)
+    )
+    if continuation_requested and session_id in (None, "", 0):
+        pages = recall_continuation_pages or []
+        expected_handle = str(recall_continuation_handle or "").strip()
+        provided_handle = str(continuation_handle or "").strip()
+        if provided_handle and expected_handle and provided_handle != expected_handle:
+            return {"result": "Recall continuation handle not found.", "exhausted": True}
+        if not pages:
+            return {"result": "No recall continuation is available.", "exhausted": True}
+        if (isinstance(page, str) and page.strip().lower() == "next") or page in (None, ""):
+            page_num = int((continuation_state or {}).get("next_page") or 2)
+        elif isinstance(page, int):
+            page_num = page
+        elif isinstance(page, str):
+            try:
+                page_num = int(page.strip())
+            except ValueError:
+                page_num = int((continuation_state or {}).get("next_page") or 2)
+        else:
+            page_num = int((continuation_state or {}).get("next_page") or 2)
+        selected = None
+        for item in pages:
+            if int(item.get("page") or 0) == page_num:
+                selected = item
+                break
+        if selected is None:
+            return {
+                "result": "Recall continuation exhausted.",
+                "page": page_num,
+                "exhausted": True,
+            }
+        if continuation_state is not None:
+            continuation_state["next_page"] = page_num + 1
+        return {
+            "result": str(selected.get("context") or ""),
+            "page": page_num,
+            "next_page": selected.get("next_page"),
+            "exhausted": bool(selected.get("exhausted")),
+            "continuation_handle": expected_handle or provided_handle or None,
+        }
+    resolved_session_id = int(session_id) if session_id is not None else 0
+    if 0 < resolved_session_id <= len(raw_sessions):
+        rs = raw_sessions[resolved_session_id - 1]
         # Check raw_session visibility (status field)
         if isinstance(rs, dict) and rs.get("status", "active") != "active":
             return {"result": f"Session {session_id} not found."}
@@ -135,8 +204,8 @@ def get_more_context(session_id: int, raw_sessions: list = None) -> dict:
             text = str(rs)
         if len(text) > 15000:
             text = text[:15000] + "\n[...truncated]"
-        return {"result": f"Full text of Session {session_id}:\n{text}"}
-    return {"result": f"Session {session_id} not found."}
+        return {"result": f"Full text of Session {resolved_session_id}:\n{text}"}
+    return {"result": f"Session {resolved_session_id} not found."}
 
 
 # ── Tool execution ──

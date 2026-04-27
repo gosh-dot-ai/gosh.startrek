@@ -6,6 +6,8 @@
 # text. Use of this file for any Commercial Purpose requires a separate
 # written license. Contact: legal@gosh.sh
 
+import pytest
+
 from src.memory import build_episode_hybrid_context
 from src.temporal import lookup_events_for_fact, lookup_ordinal_anchor, lookup_ordinal_range
 from src.temporal_normalizer import normalize_temporal_index
@@ -1674,6 +1676,41 @@ def test_temporal_planner_calendar_seeking_is_strict():
     assert classify_temporal_query("When did Joanna first watch that movie?") == "calendar"
     assert classify_temporal_query("Which year did Audrey adopt her dogs?") == "calendar"
     assert classify_temporal_query("How old was James when he started?") == "semantic"
+
+
+def test_temporal_planner_routes_schedule_queries_to_calendar():
+    assert classify_temporal_query("When should Project Alpha release be?") == "calendar"
+    assert classify_temporal_query("When will Project Alpha go live?") == "calendar"
+    assert classify_temporal_query("What date is Project Alpha scheduled for?") == "calendar"
+
+
+@pytest.mark.parametrize(
+    ("text", "timestamp", "expected"),
+    [
+        ("Project Alpha releases tonight", "2026-04-27T12:00:00+00:00", "2026-04-27"),
+        ("Project Alpha release is going to be on 2026-04-27 at night", "2026-04-20", "2026-04-27"),
+        ("Project Alpha is due in 2 days", "2026-04-27T12:00:00+00:00", "2026-04-29"),
+        ("Project Alpha starts next Friday", "2026-04-27T12:00:00+00:00", "2026-05-01"),
+    ],
+)
+def test_temporal_normalizer_grounds_schedule_and_deictic_dates(text, timestamp, expected):
+    index = normalize_temporal_index(
+        [
+            {
+                "span_id": "schedule_e01",
+                "source_id": "schedule",
+                "timeline_id": "conversation:schedule",
+                "text": text,
+                "timestamp": timestamp,
+                "support_fact_ids": ["schedule_f01"],
+                "payload": {"episode_id": "schedule_e01"},
+            }
+        ]
+    )
+
+    events = list(index.get("events", {}).values())
+    assert events
+    assert events[0]["time_start"] == expected
     plan = extract_calendar_query("Which year did Audrey adopt her dogs?")
     assert plan["mode"] == "seeking"
     assert plan["granularity"] == "year"

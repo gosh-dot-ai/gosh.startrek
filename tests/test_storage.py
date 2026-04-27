@@ -10,6 +10,7 @@ import json
 import sqlite3
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -25,6 +26,102 @@ from src.storage import (
     make_storage,
     migrate_jsonnpz_to_sqlite,
 )
+
+
+class _FakeSQLCipherConnection:
+    def __init__(self, *, fail_logging_pragmas: bool = False):
+        self.statements = []
+        self.fail_logging_pragmas = fail_logging_pragmas
+        self.row_factory = None
+
+    def execute(self, statement, *_args):
+        self.statements.append(statement)
+        if self.fail_logging_pragmas and "cipher_log" in str(statement):
+            raise RuntimeError("unsupported pragma")
+        return SimpleNamespace(fetchone=lambda: None, fetchall=list, rowcount=0)
+
+
+class _FakeSQLCipherModule:
+    Row = object()
+
+    def __init__(self, connection: _FakeSQLCipherConnection):
+        self.connection = connection
+
+    def connect(self, *_args, **_kwargs):
+        return self.connection
+
+
+def test_sqlcipher_open_paths_configure_logging_before_key(tmp_path):
+    key = b"\x01" * 32
+
+    authority_conn = _FakeSQLCipherConnection()
+    authority = object.__new__(storage_mod.SQLiteAuthorityStorage)
+    authority._path = tmp_path / "authority.sqlite3"
+    authority._encryption_key = key
+    authority._sqlite_mod = _FakeSQLCipherModule(authority_conn)
+    authority._sqlcipher = True
+    authority._open_connection()
+
+    memory_conn = _FakeSQLCipherConnection()
+    backend = object.__new__(storage_mod.SQLiteStorageBackend)
+    backend._path = tmp_path / "memory.sqlite3"
+    backend._encryption_key = key
+    backend._sqlite_mod = _FakeSQLCipherModule(memory_conn)
+    backend._sqlcipher = True
+    backend._open_connection()
+
+    expected_prefix = [
+        "PRAGMA cipher_log_level = NONE",
+        "PRAGMA cipher_log_source = NONE",
+        f"PRAGMA key = \"x'{key.hex()}'\"",
+    ]
+    assert authority_conn.statements[:3] == expected_prefix
+    assert memory_conn.statements[:3] == expected_prefix
+    assert all("cipher_memory_security" not in statement for statement in authority_conn.statements)
+    assert all("cipher_memory_security" not in statement for statement in memory_conn.statements)
+
+
+def test_sqlcipher_logging_pragmas_are_optional_and_key_still_executes(tmp_path):
+    key = b"\x02" * 32
+    conn = _FakeSQLCipherConnection(fail_logging_pragmas=True)
+    backend = object.__new__(storage_mod.SQLiteStorageBackend)
+    backend._path = tmp_path / "memory.sqlite3"
+    backend._encryption_key = key
+    backend._sqlite_mod = _FakeSQLCipherModule(conn)
+    backend._sqlcipher = True
+
+    backend._open_connection()
+
+    assert f"PRAGMA key = \"x'{key.hex()}'\"" in conn.statements
+    assert all("cipher_memory_security" not in statement for statement in conn.statements)
+
+
+def test_storage_source_never_disables_sqlcipher_memory_security_by_default():
+    for path in Path("src").rglob("*.py"):
+        assert "cipher_memory_security = off" not in path.read_text(encoding="utf-8").lower()
+
+
+def test_sqlcipher_memlock_diagnostic_is_one_shot_and_redacted(monkeypatch, caplog):
+    monkeypatch.setattr(storage_mod, "_SQLCIPHER_MEMLOCK_DIAGNOSTIC_EMITTED", False)
+    monkeypatch.setattr(
+        storage_mod,
+        "_resource",
+        SimpleNamespace(
+            RLIMIT_MEMLOCK=1,
+            RLIM_INFINITY=-1,
+            getrlimit=lambda _limit: (65536, 65536),
+        ),
+    )
+
+    with caplog.at_level("WARNING", logger=storage_mod.__name__):
+        storage_mod._maybe_log_sqlcipher_memlock_runtime_diagnostic()
+        storage_mod._maybe_log_sqlcipher_memlock_runtime_diagnostic()
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert len(messages) == 1
+    assert "RLIMIT_MEMLOCK" in messages[0]
+    assert "CAP_IPC_LOCK" in messages[0]
+    assert "010101" not in messages[0]
 
 
 def _sqlite_unique_indexes(conn, table_name: str) -> set[tuple[str, ...]]:

@@ -16,6 +16,7 @@ import logging
 import math
 import os
 import re
+import secrets
 import shutil
 from collections import Counter, defaultdict
 from collections.abc import Iterable
@@ -1531,7 +1532,15 @@ def _render_context_packet(packet: dict) -> str:
         key=lambda s: s.get("rank", 0),
     )]
     raw_lines = [s["text"] for s in sorted(
-        [seg for seg in packet.get("tier4", []) if seg.get("source") == "raw"],
+        [
+            seg
+            for seg in packet.get("tier4", [])
+            if seg.get("source") in {"raw", "raw_window", "completed_raw"}
+        ],
+        key=lambda s: s.get("rank", 0),
+    )]
+    continuation_lines = [s["text"] for s in sorted(
+        [seg for seg in packet.get("tier4", []) if seg.get("source") == "recall_continuation"],
         key=lambda s: s.get("rank", 0),
     )]
     doc_lines = [s["text"] for s in sorted(
@@ -1554,6 +1563,9 @@ def _render_context_packet(packet: dict) -> str:
         parts.append("")
         parts.append("RAW CONTEXT (source text excerpts):")
         parts.extend(raw_lines)
+    if continuation_lines:
+        parts.append("")
+        parts.extend(continuation_lines)
     if doc_lines:
         parts.append("")
         parts.append("--- SOURCE DOCUMENT SECTIONS ---")
@@ -3974,6 +3986,7 @@ class MemoryServer:
         self._raw_episode_visibility_cache_version = -1
         self._container_graph: dict = empty_container_graph()
         self._terminal_render_candidate_registry: dict[str, dict[str, Any]] = {}
+        self._recall_continuations: dict[str, dict[str, Any]] = {}
         self._temporal_index: dict = empty_temporal_index()
         self._temporal_index_dirty = True
         self._secrets: list[dict] = []
@@ -4276,19 +4289,12 @@ class MemoryServer:
                     rebuilt["_derived_write"].append(grant)
         self._instance_config = rebuilt
 
-    def _mark_tiers_dirty(self, *, preserve_derived_facts: list[dict] | None = None):
+    def _mark_tiers_dirty(self):
         """Mark derived tiers as stale and clear stale derived data."""
-        preserved_object_ids = {id(fact) for fact in preserve_derived_facts or []}
-
-        def keep_derived_fact(fact: dict) -> bool:
-            return _is_asserted_derived_fact(fact) or id(fact) in preserved_object_ids
-
         self._tiers_dirty = True
         self._temporal_index_dirty = True
-        self._all_cons = [f for f in self._all_cons if keep_derived_fact(f)]
-        self._all_cross = [
-            f for f in self._all_cross if keep_derived_fact(f) or self._is_current_supported_cross_fact(f)
-        ]
+        self._all_cons = [f for f in self._all_cons if _is_asserted_derived_fact(f)]
+        self._all_cross = [f for f in self._all_cross if self._is_current_supported_cross_fact(f)]
         self._mark_full_index_dirty()
 
     def _index_debounce_ms(self) -> int:
@@ -6343,6 +6349,7 @@ class MemoryServer:
         if not isinstance(info, dict):
             return None
         if canonical_family == "conversation" and not self._active_granular_facts_for_content_entry(info):
+            self._remove_content_indices_for_message(str(info.get("message_id") or ""))
             return None
         return dict(info)
 
@@ -10551,16 +10558,6 @@ class MemoryServer:
             return int(value)
         return 0
 
-    def _raw_session_episode_id(self, raw_session: dict) -> str:
-        raw_episode_id = str(raw_session.get("episode_id") or "").strip()
-        if raw_episode_id:
-            return raw_episode_id
-        raw_source_id = str(raw_session.get("source_id") or raw_session.get("session_key") or "").strip()
-        raw_session_num = self._raw_session_num(raw_session)
-        if raw_source_id and raw_session_num is not None:
-            return f"{self._episode_source_key(raw_source_id)}_e{int(raw_session_num):04d}"
-        return ""
-
     def _fact_backed_message_ids(self) -> set[str]:
         raw_message_by_session_id = {
             str(raw.get("raw_session_id") or ""): str(raw.get("message_id") or "")
@@ -10686,20 +10683,9 @@ class MemoryServer:
             return self._raw_episode_visibility_cache
 
         by_family: dict[str, list[dict]] = defaultdict(list)
-        inactive_episode_ids = {
-            self._raw_session_episode_id(raw)
-            for raw in self._raw_sessions
-            if isinstance(raw, dict)
-            and str(raw.get("status") or "active") != "active"
-            and self._raw_session_episode_id(raw)
-        }
         for doc in self._episode_corpus.get("documents", []):
             for episode in doc.get("episodes", []):
                 if not isinstance(episode, dict):
-                    continue
-                if str(episode.get("status") or "active") != "active":
-                    continue
-                if str(episode.get("episode_id") or "").strip() in inactive_episode_ids:
                     continue
                 if not _record_semantic_ready(episode, fallback_text=str(episode.get("raw_text") or "")):
                     continue
@@ -10905,11 +10891,10 @@ class MemoryServer:
     def _recall_mirror_signal_terms(cls, family: str, axis: str) -> tuple[str, ...]:
         axis_meta = cls.RECALL_EXTRACTION_POLICY_MIRROR.get(family, {}).get(axis, {})
         values: list[Any] = []
-        if isinstance(axis_meta, dict):
-            for key in ("prompt_declared_signals", "query_signal_lemmas"):
-                raw_values = axis_meta.get(key)
-                if isinstance(raw_values, (list, tuple, set)):
-                    values.extend(raw_values)
+        for key in ("prompt_declared_signals", "query_signal_lemmas"):
+            raw_values = axis_meta.get(key)
+            if isinstance(raw_values, (list, tuple, set)):
+                values.extend(raw_values)
         return tuple(dict.fromkeys(str(value) for value in values if str(value).strip()))
 
     @classmethod
@@ -11342,10 +11327,9 @@ class MemoryServer:
             "source_id": raw_session.get("source_id"),
             "logical_source_id": raw_session.get("logical_source_id"),
             "session_key": raw_session.get("session_key"),
-            "raw_session_id": raw_session.get("raw_session_id"),
+            "status": raw_session.get("status") or "active",
             "artifact_id": raw_session.get("artifact_id"),
             "version_id": raw_session.get("version_id"),
-            "status": raw_session.get("status") or "active",
         }
 
     def _raw_entries_same_source(self, left: dict, right: dict) -> bool:
@@ -11635,6 +11619,57 @@ class MemoryServer:
             lines.append(f"[{' '.join(prefix_parts)}] {snippet}")
         return "\n".join(lines)
 
+    def _ensure_context_packet_with_raw_sections(
+        self,
+        result: dict,
+        *,
+        original_context: str,
+        sections: list[tuple[str, str]],
+    ) -> None:
+        """Track selected raw evidence in tier4 so finalization cannot drop it."""
+        cleaned_sections = [
+            (str(source or "raw"), str(text or "").strip())
+            for source, text in sections
+            if str(text or "").strip()
+        ]
+        if not cleaned_sections:
+            return
+        packet = deepcopy(result.get("_context_packet"))
+        if not isinstance(packet, dict):
+            packet = {
+                "tier1": [],
+                "tier2": [],
+                "tier3": [
+                    {
+                        "text": str(original_context or ""),
+                        "rank": 0,
+                        "source": "fact",
+                    }
+                ] if str(original_context or "").strip() else [],
+                "tier4": [],
+            }
+        for tier in ("tier1", "tier2", "tier3", "tier4"):
+            values = packet.get(tier)
+            packet[tier] = list(values) if isinstance(values, list) else []
+        existing = {
+            (str(item.get("source") or ""), str(item.get("text") or ""))
+            for item in packet["tier4"]
+            if isinstance(item, dict)
+        }
+        next_rank = len(packet["tier4"])
+        for source, text in cleaned_sections:
+            key = (source, text)
+            if key in existing:
+                continue
+            packet["tier4"].append({
+                "text": text,
+                "rank": next_rank,
+                "source": source,
+            })
+            existing.add(key)
+            next_rank += 1
+        result["_context_packet"] = packet
+
     def _merge_raw_recall(
         self,
         *,
@@ -11721,7 +11756,16 @@ class MemoryServer:
             return result
         raw_context = self._render_raw_recall_context(raw_results)
         context = str(result.get("context") or "").strip()
-        raw_sections = [section for section in (raw_window_context, raw_context) if section]
+        raw_section_pairs = [
+            ("raw_window", raw_window_context),
+            ("raw", raw_context),
+        ]
+        self._ensure_context_packet_with_raw_sections(
+            result,
+            original_context=context,
+            sections=raw_section_pairs,
+        )
+        raw_sections = [section for _source, section in raw_section_pairs if section]
         if context and raw_sections:
             result["context"] = f"{context}\n\n" + "\n\n".join(raw_sections)
         elif raw_sections:
@@ -11759,6 +11803,381 @@ class MemoryServer:
             "window_episode_ids": list(window_episode_ids),
         }
         result["runtime_trace"] = runtime_trace
+        return result
+
+    def _recall_continuation_anchor_terms(self, query: str) -> list[str]:
+        terms = list(self._raw_query_tokens(query))
+        if terms:
+            return terms
+        return [
+            token
+            for token in re.findall(r"[A-Za-z0-9_.-]+", str(query or "").lower())
+            if len(token) > 2 and token not in STOP_WORDS
+        ][:8]
+
+    def _score_fact_for_recall_continuation(self, fact: dict, anchor_terms: list[str]) -> float:
+        text = " ".join(
+            str(value or "")
+            for value in (
+                fact.get("fact"),
+                fact.get("subject"),
+                fact.get("predicate"),
+                fact.get("object"),
+            )
+        ).lower()
+        if not text or not anchor_terms:
+            return 0.0
+        score = 0.0
+        for term in anchor_terms:
+            normalized = str(term or "").lower()
+            if not normalized:
+                continue
+            if normalized in text:
+                score += 1.0 + min(text.count(normalized), 3) * 0.1
+        return score
+
+    def _render_recall_continuation_page(self, items: list[dict], *, page_num: int) -> str:
+        fact_lines: list[str] = []
+        raw_items: list[dict] = []
+        for item in items:
+            if item.get("candidate_kind") == "raw":
+                raw = dict(item.get("item") or {})
+                if raw:
+                    raw_items.append(raw)
+                continue
+            fact = dict(item.get("item") or {})
+            text = str(fact.get("fact") or "").strip()
+            if not text:
+                continue
+            session = fact.get("session")
+            prefix = f"(S{session}) " if session else ""
+            fact_lines.append(f"- {prefix}{text}")
+        sections = [f"RECALL CONTINUATION PAGE {page_num}:"]
+        if fact_lines:
+            sections.append("RETRIEVED FACTS:\n" + "\n".join(fact_lines))
+        raw_context = self._render_raw_recall_context(raw_items)
+        if raw_context:
+            sections.append(raw_context)
+        rendered = "\n\n".join(sections).strip()
+        if len(rendered) > 6000:
+            rendered = rendered[:6000] + "\n[...truncated]"
+        return rendered
+
+    def _recall_continuation_now_ms(self) -> int:
+        return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+    def _recall_continuation_ttl_ms(self) -> int:
+        try:
+            return max(1_000, int(os.getenv("GOSH_MEMORY_RECALL_CONTINUATION_TTL_MS", "600000")))
+        except Exception:
+            return 600_000
+
+    def _prune_recall_continuations(self, now_ms: int | None = None) -> None:
+        now_ms = self._recall_continuation_now_ms() if now_ms is None else now_ms
+        for handle in [
+            handle
+            for handle, state in self._recall_continuations.items()
+            if int(state.get("expires_at_ms") or 0) <= now_ms
+        ]:
+            self._recall_continuations.pop(handle, None)
+
+    def _recall_continuation_acl_key(
+        self,
+        *,
+        caller_id: str | None,
+        caller_memberships: list | None,
+        caller_role: str,
+        swarm_id: str | None,
+    ) -> tuple[str, str, tuple[str, ...], str]:
+        return (
+            str(caller_id or ""),
+            str(caller_role or "user"),
+            tuple(sorted(str(member) for member in (caller_memberships or []))),
+            str(swarm_id or ""),
+        )
+
+    def _remember_recall_continuation(
+        self,
+        result: dict,
+        *,
+        caller_id: str | None,
+        caller_memberships: list | None,
+        caller_role: str,
+        swarm_id: str | None,
+    ) -> None:
+        continuation = result.get("recall_continuation")
+        pages = result.get("_recall_continuation_pages")
+        if not isinstance(continuation, dict) or not continuation.get("available") or not pages:
+            return
+        handle = str(continuation.get("handle") or "").strip()
+        if not handle:
+            return
+        now_ms = self._recall_continuation_now_ms()
+        self._prune_recall_continuations(now_ms)
+        self._recall_continuations[handle] = {
+            "pages": deepcopy(pages),
+            "acl_key": self._recall_continuation_acl_key(
+                caller_id=caller_id,
+                caller_memberships=caller_memberships,
+                caller_role=caller_role,
+                swarm_id=swarm_id,
+            ),
+            "next_page": int(continuation.get("next_page") or 2),
+            "page_size": int(continuation.get("page_size") or 0),
+            "candidate_count": int(continuation.get("candidate_count") or 0),
+            "returned_count": int(continuation.get("returned_count") or 0),
+            "anchor_terms": list(continuation.get("anchor_terms") or []),
+            "expires_at_ms": now_ms + self._recall_continuation_ttl_ms(),
+        }
+
+    def recall_continuation_page(
+        self,
+        *,
+        continuation_handle: str,
+        page: int | str | None = "next",
+        caller_id: str | None,
+        caller_memberships: list | None,
+        caller_role: str,
+        swarm_id: str | None,
+    ) -> dict:
+        handle = str(continuation_handle or "").strip()
+        now_ms = self._recall_continuation_now_ms()
+        self._prune_recall_continuations(now_ms)
+        state = self._recall_continuations.get(handle)
+        acl_key = self._recall_continuation_acl_key(
+            caller_id=caller_id,
+            caller_memberships=caller_memberships,
+            caller_role=caller_role,
+            swarm_id=swarm_id,
+        )
+        if not state or state.get("acl_key") != acl_key:
+            return {
+                "error": "Recall continuation not found",
+                "code": "RECALL_CONTINUATION_NOT_FOUND",
+                "recall_continuation": {
+                    "available": False,
+                    "handle": handle,
+                    "exhausted": True,
+                },
+            }
+        if (isinstance(page, str) and page.strip().lower() == "next") or page in (None, ""):
+            page_num = int(state.get("next_page") or 2)
+        elif isinstance(page, int):
+            page_num = page
+        elif isinstance(page, str):
+            try:
+                page_num = int(page.strip())
+            except ValueError:
+                page_num = int(state.get("next_page") or 2)
+        else:
+            page_num = int(state.get("next_page") or 2)
+        selected = None
+        for item in state.get("pages") or []:
+            if int(item.get("page") or 0) == page_num:
+                selected = item
+                break
+        if selected is None:
+            self._recall_continuations.pop(handle, None)
+            return {
+                "context": "Recall continuation exhausted.",
+                "retrieved": [],
+                "query_type": "continuation",
+                "recall_continuation": {
+                    "available": False,
+                    "handle": handle,
+                    "page": page_num,
+                    "exhausted": True,
+                },
+                "runtime_trace": {
+                    "recall_continuation": {
+                        "page": page_num,
+                        "exhausted": True,
+                        "public_mcp_tool": "memory_recall",
+                    }
+                },
+            }
+        next_page = selected.get("next_page")
+        exhausted = bool(selected.get("exhausted"))
+        if next_page:
+            state["next_page"] = int(next_page)
+            state["expires_at_ms"] = now_ms + self._recall_continuation_ttl_ms()
+        else:
+            exhausted = True
+            self._recall_continuations.pop(handle, None)
+        return {
+            "context": str(selected.get("context") or ""),
+            "retrieved": [],
+            "query_type": "continuation",
+            "recall_continuation": {
+                "available": not exhausted,
+                "handle": handle,
+                "page": page_num,
+                "next_page": next_page,
+                "page_size": state.get("page_size", 0),
+                "candidate_count": state.get("candidate_count", 0),
+                "returned_count": state.get("returned_count", 0),
+                "exhausted": exhausted,
+                "anchor_terms": list(state.get("anchor_terms") or []),
+            },
+            "runtime_trace": {
+                "recall_continuation": {
+                    "page": page_num,
+                    "exhausted": exhausted,
+                    "public_mcp_tool": "memory_recall",
+                }
+            },
+        }
+
+    def _attach_recall_continuation(
+        self,
+        *,
+        query: str,
+        result: dict,
+        fact_filter,
+        caller_id: str,
+        caller_memberships: list[str],
+        caller_role: str,
+        swarm_id: str | None,
+        raw_kind: str,
+    ) -> dict:
+        if raw_kind != "all":
+            return result
+        families = self._raw_families_for_result(
+            result.get("search_family"),
+            result.get("retrieval_families"),
+        )
+        if not families or families == {"codebase"}:
+            return result
+        anchor_terms = self._recall_continuation_anchor_terms(query)
+        if not anchor_terms:
+            return result
+        retrieved_items = list(result.get("retrieved") or [])
+        seen_fact_ids = {
+            str(item.get("id") or "").strip()
+            for item in retrieved_items
+            if isinstance(item, dict) and str(item.get("id") or "").strip()
+        }
+        seen_raw_keys = {
+            str(item.get("message_id") or item.get("episode_id") or item.get("content") or "").strip()
+            for item in retrieved_items
+            if isinstance(item, dict)
+        }
+        candidates: list[dict] = []
+        for fact in [*self._all_granular, *self._all_cons, *self._all_cross]:
+            if not isinstance(fact, dict):
+                continue
+            fact_id = str(fact.get("id") or "").strip()
+            if not fact_id or fact_id in seen_fact_ids:
+                continue
+            if not fact_filter(fact):
+                continue
+            family = self._fact_source_family(fact) or ("conversation" if "conversation" in families else "")
+            if family == "codebase" or (families and family not in families):
+                continue
+            score = self._score_fact_for_recall_continuation(fact, anchor_terms)
+            if score <= 0:
+                continue
+            candidates.append({
+                "candidate_kind": "fact",
+                "score": score,
+                "session_num": _coerce_positive_session_num(fact.get("session")) or 0,
+                "timestamp_ms": 0,
+                "stable_id": fact_id,
+                "item": fact,
+            })
+        raw_candidates = self._raw_recall_entries(
+            query=query,
+            families=families,
+            caller_id=caller_id,
+            caller_memberships=caller_memberships,
+            caller_role=caller_role,
+            swarm_id=swarm_id,
+            result_type=str(result.get("query_type") or ""),
+            retrieved_items=[],
+            exclude_episode_ids=set(result.get("actual_injected_episode_ids") or []),
+            disable_adjacent_answers=True,
+            limit=64,
+        )
+        for raw in raw_candidates:
+            key = str(raw.get("message_id") or raw.get("episode_id") or raw.get("content") or "").strip()
+            if key and key in seen_raw_keys:
+                continue
+            candidates.append({
+                "candidate_kind": "raw",
+                "score": float(raw.get("score") or 0.0),
+                "session_num": self._raw_session_num(raw) or 0,
+                "timestamp_ms": int(raw.get("timestamp_ms") or 0),
+                "stable_id": key,
+                "item": raw,
+            })
+        if not candidates:
+            return result
+        candidates.sort(
+            key=lambda item: (
+                -float(item.get("score") or 0.0),
+                -int(item.get("session_num") or 0),
+                -int(item.get("timestamp_ms") or 0),
+                str(item.get("stable_id") or ""),
+            )
+        )
+        page_size = 5
+        max_pages = 6
+        pages: list[dict] = []
+        for page_index in range(max_pages):
+            start = page_index * page_size
+            chunk = candidates[start:start + page_size]
+            if not chunk:
+                break
+            page_num = page_index + 2
+            next_start = start + page_size
+            pages.append({
+                "page": page_num,
+                "next_page": page_num + 1 if next_start < len(candidates) and page_index + 1 < max_pages else None,
+                "exhausted": not (next_start < len(candidates) and page_index + 1 < max_pages),
+                "context": self._render_recall_continuation_page(chunk, page_num=page_num),
+                "returned_count": len(chunk),
+            })
+        if not pages:
+            return result
+        handle = secrets.token_urlsafe(24)
+        while handle in self._recall_continuations:
+            handle = secrets.token_urlsafe(24)
+        result["_recall_continuation_pages"] = pages
+        result["recall_continuation"] = {
+            "available": True,
+            "handle": handle,
+            "next_page": 2,
+            "page_size": page_size,
+            "candidate_count": len(candidates),
+            "returned_count": len(retrieved_items),
+            "exhausted": False,
+            "anchor_terms": anchor_terms,
+            "tool": "get_more_context",
+            "tool_usage": "call get_more_context with page=\"next\" or without session_id to fetch the next evidence page",
+        }
+        continuation_note = self._recall_continuation_context_note(result.get("recall_continuation"))
+        context = str(result.get("context") or "").strip()
+        self._ensure_context_packet_with_raw_sections(
+            result,
+            original_context=context,
+            sections=[("recall_continuation", continuation_note)],
+        )
+        result["context"] = f"{context}\n\n{continuation_note}" if context else continuation_note
+        runtime_trace = dict(result.get("runtime_trace") or {})
+        runtime_trace["recall_continuation"] = {
+            "available": True,
+            "candidate_count": len(candidates),
+            "page_count": len(pages),
+            "anchor_terms": anchor_terms,
+        }
+        result["runtime_trace"] = runtime_trace
+        self._remember_recall_continuation(
+            result,
+            caller_id=caller_id,
+            caller_memberships=caller_memberships,
+            caller_role=caller_role,
+            swarm_id=swarm_id,
+        )
         return result
 
     async def write(
@@ -12075,15 +12494,15 @@ class MemoryServer:
                     result = await self._extract_write_log_entry(entry)
                     if isinstance(result, dict) and result.get("error"):
                         if result.get("code") == "CANONICALIZATION_ERROR":
-                            error_metadata_patch = {
+                            metadata_patch = {
                                 "terminal_error_code": "CANONICALIZATION_ERROR",
                                 "canonicalization_status": "failed",
                                 "canonicalization_error": str(result.get("error") or ""),
                             }
                             for key in ("raw_session_id", "source_id", "extraction_format"):
                                 if result.get(key) is not None:
-                                    error_metadata_patch[key] = str(result[key])
-                            ingress_storage.merge_write_log_metadata(entry["message_id"], error_metadata_patch)
+                                    metadata_patch[key] = str(result[key])
+                            ingress_storage.merge_write_log_metadata(entry["message_id"], metadata_patch)
                             ingress_storage.mark_write_state(entry["message_id"], "complete")
                             processed += 1
                             continue
@@ -14413,7 +14832,7 @@ class MemoryServer:
             return {"status": "ok", "facts_extracted": 0}
 
         self._data_dict = None
-        self._mark_tiers_dirty(preserve_derived_facts=doc_cross)
+        self._mark_tiers_dirty()
         result = {"status": "ok", "facts_extracted": total_facts}
         if near_duplicate_warning:
             result["near_duplicate_warning"] = near_duplicate_warning
@@ -15045,7 +15464,7 @@ class MemoryServer:
             self._save_cache()
 
         self._data_dict = None
-        self._mark_tiers_dirty(preserve_derived_facts=doc_cross)
+        self._mark_tiers_dirty()
         result = {"status": "ok", "facts_extracted": total_facts}
         if near_duplicate_warning:
             result["near_duplicate_warning"] = near_duplicate_warning
@@ -16190,8 +16609,8 @@ class MemoryServer:
     async def build_index(self, *, _lease_acquired: bool = False) -> dict:
         """Embed current tiers and build retrieval state."""
         if not _lease_acquired and self._storage_supports_index_coordination():
-            storage = cast(Any, self._storage)
             now_ms = self._now_ms()
+            storage = cast(Any, self._storage)
             lease = storage.acquire_index_build_lease(
                 worker_id=self._worker_id,
                 snapshot_fingerprint=self._index_snapshot_fingerprint(),
@@ -16539,6 +16958,16 @@ class MemoryServer:
             result = self._merge_raw_recall(
                 query=retrieval_query,
                 result=result,
+                caller_id=_caller_id,
+                caller_memberships=_memberships,
+                caller_role=_role,
+                swarm_id=_swarm_for_raw,
+                raw_kind=kind,
+            )
+            result = self._attach_recall_continuation(
+                query=retrieval_query,
+                result=result,
+                fact_filter=fact_filter,
                 caller_id=_caller_id,
                 caller_memberships=_memberships,
                 caller_role=_role,
@@ -17863,6 +18292,40 @@ class MemoryServer:
             plugin_state=self._effective_inference_leaf_plugins(recall_result),
         )
 
+    def _recall_continuation_context_note(self, continuation: dict | None) -> str:
+        if not isinstance(continuation, dict) or not continuation.get("available"):
+            return ""
+        anchor_terms = continuation.get("anchor_terms") or []
+        if anchor_terms:
+            anchor_text = f"More evidence matches anchors {anchor_terms}. "
+        else:
+            anchor_text = "More evidence matches this recall query. "
+        return (
+            "RECALL CONTINUATION AVAILABLE:\n"
+            f"{anchor_text}"
+            "If the answer is not in this page, call get_more_context with page=\"next\" "
+            "or without session_id to retrieve the next evidence page."
+        )
+
+    def _context_packet_with_recall_continuation(self, context_packet: dict, recall_result: dict) -> dict:
+        packet = deepcopy(context_packet)
+        note = self._recall_continuation_context_note(recall_result.get("recall_continuation"))
+        if not note:
+            return packet
+        tier4 = packet.setdefault("tier4", [])
+        for segment in tier4:
+            if segment.get("source") == "recall_continuation":
+                return packet
+            if "RECALL CONTINUATION AVAILABLE:" in str(segment.get("text") or ""):
+                return packet
+        max_rank = max((int(segment.get("rank") or 0) for segment in tier4), default=-1)
+        tier4.append({
+            "text": note,
+            "rank": max_rank + 1,
+            "source": "recall_continuation",
+        })
+        return packet
+
     def _effective_inference_leaf_plugins(self, recall_result: dict | None = None) -> dict[str, bool]:
         plugin_state = dict(self._inference_leaf_plugins)
         overrides = (recall_result or {}).get("inference_leaf_plugins")
@@ -17873,7 +18336,7 @@ class MemoryServer:
     def _recommended_profile_for_recall_result(self, recall_result: dict) -> str | None:
         if not self._has_profiles():
             return None
-        profiles = self._profiles or {}
+        profiles = self._profiles
         if not profiles:
             return None
         complexity_hint = recall_result.get("complexity_hint") or {}
@@ -17964,6 +18427,19 @@ class MemoryServer:
                 "final_render_available_in_recall": False,
                 "model_path_required": bool(terminal_candidate.get("model_path_required", True)),
                 "whole_or_fail": bool(terminal_candidate.get("whole_or_fail", True)),
+            }
+        continuation = recall_result.get("recall_continuation")
+        if isinstance(continuation, dict) and continuation.get("available"):
+            contract["recall_continuation"] = {
+                "available": True,
+                "tool": "get_more_context",
+                "handle": continuation.get("handle"),
+                "next_page": continuation.get("next_page"),
+                "instruction": (
+                    "The returned context is the first evidence page. "
+                    "If the answer is not present and more evidence is available, "
+                    "call get_more_context with page=\"next\" or no session_id to fetch the next page."
+                ),
             }
         return contract
 
@@ -18123,7 +18599,10 @@ class MemoryServer:
             explicit_max_tokens=max_tokens,
         )
         memory_budget = self._compute_memory_budget(cfg, resolved_max_tokens)
-        context_packet = self._context_packet_for_recall_result(finalized)
+        context_packet = self._context_packet_with_recall_continuation(
+            self._context_packet_for_recall_result(finalized),
+            finalized,
+        )
 
         try:
             packet, rendered_context, _payload, meta = self._truncate_by_priority(
@@ -19595,6 +20074,14 @@ class MemoryServer:
         caller_id: str = None,
         secret_ref: dict | None = None,
     ) -> tuple[str, bool, list[dict]]:
+        continuation_pages = list(payload.get("_recall_continuation_pages") or [])
+        continuation_handle = str(payload.get("_recall_continuation_handle") or "")
+        continuation_state = {"next_page": 2}
+        payload = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"_recall_continuation_pages", "_recall_continuation_handle"}
+        }
         model = payload["model"]
         backend = str(payload.get("backend") or "api")
         provider = _provider_for_model(model)
@@ -19683,6 +20170,11 @@ class MemoryServer:
                     result_obj = get_more_context(
                         input_data.get("session_id", 0),
                         raw_sessions=self._raw_sessions,
+                        page=input_data.get("page"),
+                        continuation_handle=input_data.get("continuation_handle"),
+                        recall_continuation_pages=continuation_pages,
+                        recall_continuation_handle=continuation_handle,
+                        continuation_state=continuation_state,
                     ) if tu.name == "get_more_context" else json.loads(
                         json.dumps({"error": f"Unknown tool: {tu.name}"})
                     )
@@ -19740,6 +20232,11 @@ class MemoryServer:
                     tool_result = get_more_context(
                         args.get("session_id", 0),
                         raw_sessions=self._raw_sessions,
+                        page=args.get("page"),
+                        continuation_handle=args.get("continuation_handle"),
+                        recall_continuation_pages=continuation_pages,
+                        recall_continuation_handle=continuation_handle,
+                        continuation_state=continuation_state,
                     )
                     if hasattr(self, "_audit"):
                         self._audit.log(
@@ -19895,6 +20392,12 @@ class MemoryServer:
         payload = plan["payload"]
         payload_meta = plan["payload_meta"]
         secret_ref = plan.get("secret_ref")
+        if payload_meta.get("use_tool") and recall_result.get("_recall_continuation_pages"):
+            payload = dict(payload)
+            payload["_recall_continuation_pages"] = deepcopy(recall_result.get("_recall_continuation_pages") or [])
+            payload["_recall_continuation_handle"] = (
+                (recall_result.get("recall_continuation") or {}).get("handle")
+            )
 
         estimated_cost_raw = self._estimate_payload_cost(payload=payload, payload_meta=payload_meta)
         estimated_cost = round(estimated_cost_raw, 6) if estimated_cost_raw is not None else 0.0

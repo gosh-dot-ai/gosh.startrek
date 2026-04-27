@@ -13,6 +13,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import logging
 import os
 import sqlite3
 import tempfile
@@ -26,6 +27,16 @@ import numpy as np
 
 from .episodes import load_episode_corpus
 from .normalizer import acl_domain_key, dedup_domain_key
+
+_resource: Any
+try:
+    import resource as _resource
+except ImportError:  # pragma: no cover - non-Unix platforms
+    _resource = None
+
+log = logging.getLogger(__name__)
+_SQLCIPHER_MEMLOCK_DIAGNOSTIC_EMITTED = False
+_SQLCIPHER_MEMLOCK_DIAGNOSTIC_LOCK = threading.Lock()
 
 
 @runtime_checkable
@@ -324,6 +335,48 @@ def _sqlcipher_available() -> bool:
     return importlib.util.find_spec("pysqlcipher3") is not None
 
 
+def _execute_sqlcipher_pragma_if_supported(conn: Any, statement: str) -> None:
+    try:
+        conn.execute(statement)
+    except Exception:
+        # SQLCipher logging pragmas were added after older SQLCipher releases.
+        # They are optional noise-control settings; unsupported builds should
+        # still open encrypted databases normally.
+        return
+
+
+def _maybe_log_sqlcipher_memlock_runtime_diagnostic() -> None:
+    global _SQLCIPHER_MEMLOCK_DIAGNOSTIC_EMITTED
+    if _resource is None:
+        return
+    try:
+        soft, hard = _resource.getrlimit(_resource.RLIMIT_MEMLOCK)
+    except Exception:
+        return
+    if soft == _resource.RLIM_INFINITY or soft >= 1024 * 1024:
+        return
+    with _SQLCIPHER_MEMLOCK_DIAGNOSTIC_LOCK:
+        if _SQLCIPHER_MEMLOCK_DIAGNOSTIC_EMITTED:
+            return
+        _SQLCIPHER_MEMLOCK_DIAGNOSTIC_EMITTED = True
+    log.warning(
+        "SQLCipher secure-memory locking may be limited by process/container "
+        "RLIMIT_MEMLOCK (soft=%s hard=%s). If native sqlcipher_mlock warnings "
+        "appear, fix the runtime with an adequate memlock limit and, where "
+        "required, CAP_IPC_LOCK. SQLCipher memory security remains enabled.",
+        soft,
+        hard,
+    )
+
+
+def _configure_sqlcipher_connection_logging(conn: Any) -> None:
+    # These PRAGMAs only control SQLCipher's internal log output. They do not
+    # disable encryption, key derivation, HMAC checks, or memory security.
+    _execute_sqlcipher_pragma_if_supported(conn, "PRAGMA cipher_log_level = NONE")
+    _execute_sqlcipher_pragma_if_supported(conn, "PRAGMA cipher_log_source = NONE")
+    _maybe_log_sqlcipher_memlock_runtime_diagnostic()
+
+
 def _env_truthy(name: str) -> bool:
     return str(os.environ.get(name, "")).strip().lower() in {"1", "true", "yes", "on"}
 
@@ -480,6 +533,7 @@ class SQLiteAuthorityStorage:
     def _open_connection(self):
         conn = self._sqlite_mod.connect(str(self._path), timeout=30, check_same_thread=False)
         if self._sqlcipher:
+            _configure_sqlcipher_connection_logging(conn)
             conn.execute(f"PRAGMA key = \"x'{self._encryption_key.hex()}'\"")
         conn.row_factory = self._sqlite_mod.Row
         conn.execute("PRAGMA foreign_keys = ON")
@@ -1390,6 +1444,7 @@ class SQLiteStorageBackend:
     def _open_connection(self):
         conn = self._sqlite_mod.connect(str(self._path), timeout=30, check_same_thread=False)
         if self._sqlcipher:
+            _configure_sqlcipher_connection_logging(conn)
             conn.execute(f"PRAGMA key = \"x'{self._encryption_key.hex()}'\"")
         conn.row_factory = self._sqlite_mod.Row
         conn.execute("PRAGMA foreign_keys = ON")

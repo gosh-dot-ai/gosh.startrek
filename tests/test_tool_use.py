@@ -66,3 +66,34 @@ def test_get_context_tool_schema():
     """GET_CONTEXT_TOOL has correct structure."""
     assert GET_CONTEXT_TOOL["name"] == "get_more_context"
     assert "session_id" in GET_CONTEXT_TOOL["input_schema"]["properties"]
+    assert "page" in GET_CONTEXT_TOOL["input_schema"]["properties"]
+
+
+def test_get_more_context_continuation_pages():
+    state = {"next_page": 2}
+    pages = [
+        {"page": 2, "context": "page two evidence", "next_page": 3, "exhausted": False},
+        {"page": 3, "context": "page three evidence", "next_page": None, "exhausted": True},
+    ]
+
+    first = get_more_context(
+        raw_sessions=[],
+        page="next",
+        recall_continuation_pages=pages,
+        recall_continuation_handle="h1",
+        continuation_handle="h1",
+        continuation_state=state,
+    )
+    second = get_more_context(
+        raw_sessions=[],
+        page="next",
+        recall_continuation_pages=pages,
+        recall_continuation_handle="h1",
+        continuation_handle="h1",
+        continuation_state=state,
+    )
+
+    assert first["result"] == "page two evidence"
+    assert first["page"] == 2
+    assert second["result"] == "page three evidence"
+    assert second["exhausted"] is True

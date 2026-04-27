@@ -420,6 +420,56 @@ def test_truncation_preserves_tier1_and_drops_raw_first(tmp_path):
     assert meta["truncation"]["removed"]["tier4"] >= 1
 
 
+def test_valid_profile_finalization_renders_raw_window_and_continuation_segments(tmp_path):
+    ms = MemoryServer(
+        str(tmp_path),
+        "ctx_raw_window_finalized",
+        profiles={1: "fast"},
+        profile_configs={"fast": PROFILE_CONFIGS["fast"]},
+    )
+    recall_result = {
+        "context": "",
+        "_context_packet": {
+            "tier1": [{"text": "[1] Project Alpha workflow exists.", "rank": 0, "source": "fact"}],
+            "tier2": [],
+            "tier3": [],
+            "tier4": [
+                {
+                    "text": "RAW CONVERSATION EVIDENCE:\n[conversation] assistant: Project Alpha releases at night.",
+                    "rank": 0,
+                    "source": "raw_window",
+                },
+            ],
+        },
+        "recall_continuation": {
+            "available": True,
+            "handle": "test-handle",
+            "next_page": 2,
+            "anchor_terms": ["project", "alpha"],
+        },
+        "query_type": "default",
+        "recommended_profile": "fast",
+        "recommended_prompt_type": "lookup",
+        "use_tool": True,
+        "sessions_in_context": 1,
+        "total_sessions": 4,
+        "coverage_pct": 25,
+        "runtime_trace": {},
+    }
+
+    finalized, trace = ms._finalize_recall_evidence_context(
+        query="When should Project Alpha release?",
+        recall_result=recall_result,
+    )
+
+    assert trace["finalized"] is True
+    assert "RAW CONVERSATION EVIDENCE:" in finalized["context"]
+    assert "Project Alpha releases at night." in finalized["context"]
+    assert "RECALL CONTINUATION AVAILABLE:" in finalized["context"]
+    assert 'page="next"' in finalized["context"]
+    assert finalized["context"].count("RECALL CONTINUATION AVAILABLE:") == 1
+
+
 def test_inference_plan_finalizes_unfinalized_context_packet_before_payload(tmp_path):
     ms = MemoryServer(
         str(tmp_path),
@@ -458,6 +508,60 @@ def test_inference_plan_finalizes_unfinalized_context_packet_before_payload(tmp_
     assert "evidence_context" not in recall_result["runtime_trace"]
     assert recall_result["runtime_trace"]["caller"]["kept"] is True
     assert "_payload_secret_ref" not in recall_result
+
+
+def test_tool_payload_has_visible_continuation_instruction_with_answer_contract(tmp_path):
+    ms = MemoryServer(
+        str(tmp_path),
+        "ctx_tool_continuation_visible",
+        profiles={1: "fast"},
+        profile_configs={"fast": PROFILE_CONFIGS["fast"]},
+    )
+    recall_result = {
+        "context": "",
+        "_context_packet": {
+            "tier1": [{"text": "[1] Project Alpha workflow checkpoint.", "rank": 0, "source": "fact"}],
+            "tier2": [],
+            "tier3": [],
+            "tier4": [],
+        },
+        "recall_continuation": {
+            "available": True,
+            "handle": "test-handle",
+            "next_page": 2,
+            "anchor_terms": ["project", "alpha"],
+        },
+        "_recall_continuation_pages": [
+            {"page": 2, "context": "RECALL CONTINUATION PAGE 2:\n[1] Project Alpha schedule fact."},
+        ],
+        "query_type": "default",
+        "recommended_profile": "fast",
+        "recommended_prompt_type": "tool",
+        "use_tool": True,
+        "sessions_in_context": 1,
+        "total_sessions": 4,
+        "coverage_pct": 25,
+        "runtime_trace": {},
+    }
+
+    finalized, _trace = ms._finalize_recall_evidence_context(
+        query="When should Project Alpha release?",
+        recall_result=recall_result,
+    )
+    assert finalized["answer_contract"]["recall_continuation"]["available"] is True
+
+    plan = ms._build_inference_plan_from_recall_result(
+        query="When should Project Alpha release?",
+        recall_result=finalized,
+        use_tool=True,
+    )
+    payload_text = "\n".join(str(message.get("content") or "") for message in plan["payload"]["messages"])
+
+    assert "RECALL CONTINUATION AVAILABLE:" in payload_text
+    assert 'page="next"' in payload_text
+    assert "without session_id" in payload_text
+    assert any((tool.get("function") or {}).get("name") == "get_more_context" for tool in plan["payload"]["tools"])
+    assert plan["payload_meta"]["use_tool"] is True
 
 
 def test_public_answer_contract_documents_prompt_template_and_reference_date(tmp_path):

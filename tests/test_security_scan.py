@@ -15,7 +15,7 @@ from tests._archive_repo import archive_repo_root
 
 
 def _load_security_scan_module():
-    module_path = Path(__file__).resolve().parents[1] / "ci" / "scripts" / "security_scan.py"
+    module_path = Path(__file__).resolve().parents[1] / "scripts" / "ci" / "security_scan.py"
     spec = importlib.util.spec_from_file_location("security_scan", module_path)
     assert spec is not None
     assert spec.loader is not None

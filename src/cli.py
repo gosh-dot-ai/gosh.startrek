@@ -10,6 +10,7 @@
 import argparse
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -22,7 +23,7 @@ def cmd_start(args):
     import uvicorn
 
     from .config import MemoryConfig
-    from .mcp_server import SERVER_TOKEN, _save_token, create_app
+    from .mcp_server import SERVER_TOKEN, _save_token, create_app, log_startup_lines, startup_log_lines
 
     if args.server_token:
         import src.mcp_server as _mcp_mod
@@ -76,18 +77,22 @@ def cmd_start(args):
     else:
         scheme = "http"
 
-    print(f"gosh.memory MCP Server")
-    print(f"  Listening: {scheme}://{args.host}:{args.port}")
-    print(f"  Data dir:  {Path(args.data_dir).resolve()}")
-    print(f"  Embeddings:{_embed_prov} / {_embed_mod}")
-    print(f"  TLS:       {'ON' if use_tls else 'off'}")
-    print(f"  POST /mcp     — tool calls")
-    print(f"  GET  /mcp/sse — Courier SSE")
-    print(f"  Token:    {SERVER_TOKEN}")
-    print(f"  Saved to: {token_path}")
+    lines = startup_log_lines(
+        title="gosh.memory MCP Server",
+        listening=f"{scheme}://{args.host}:{args.port}",
+        data_dir=str(Path(args.data_dir).resolve()),
+        embeddings=f"{_embed_prov} / {_embed_mod}",
+        tls="ON" if use_tls else "off",
+        token=SERVER_TOKEN,
+        token_path=token_path,
+    )
     if join_token_str:
-        print(f"\n  Join token (pass to agents on remote machines):")
-        print(f"  gosh-agent --join {join_token_str}\n")
+        if os.environ.get("GOSH_MEMORY_PRINT_JOIN_TOKEN") == "1":
+            lines.append("Join token requested by GOSH_MEMORY_PRINT_JOIN_TOKEN=1")
+            lines.append(f"gosh-agent --join {join_token_str}")
+        else:
+            lines.append("Join token: [redacted] (set GOSH_MEMORY_PRINT_JOIN_TOKEN=1 to print explicitly)")
+    log_startup_lines(lines)
     uvicorn.run(app, host=args.host, port=args.port, **ssl_kwargs)
 
 

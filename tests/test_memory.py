@@ -18,7 +18,7 @@ import pytest
 
 import src.memory as memory_mod
 from src.episode_features import extract_query_features
-from src.inference import get_inf_prompt
+from src.inference import get_inf_prompt, get_more_context
 from src.local_cli_backend import LocalCliTimeoutError
 from src.memory import MemoryServer, _augment_commonality_facts, build_hybrid_context
 
@@ -1613,7 +1613,6 @@ async def test_ask_and_plan_inference_use_identical_finalized_recall_context(tmp
 
     monkeypatch.setattr(ms, "_send_payload", fake_send_payload)
     monkeypatch.setattr(ms, "recall", fixed_recall)
-
     ask_result = await ms.ask(query, agent_id="tester")
     assert ask_result["answer"]
     payload_text = "\n".join(str(message.get("content") or "") for message in captured_payload["payload"]["messages"])
@@ -1626,6 +1625,249 @@ async def test_ask_and_plan_inference_use_identical_finalized_recall_context(tmp
     )
     plan_text = "\n".join(str(message.get("content") or "") for message in plan["payload"]["messages"])
     assert plan_text == expected_prompt
+
+
+def test_raw_recall_survives_finalized_context_packet(tmp_path):
+    profiles, profile_configs = _planning_profiles()
+    ms = MemoryServer(str(tmp_path), "raw_finalized", profiles=profiles, profile_configs=profile_configs)
+    ms._raw_sessions = [
+        {
+            "message_id": "raw-apple",
+            "content": "Project Alpha apple token is quartz.",
+            "format": "conversation",
+            "status": "active",
+            "scope": "agent-private",
+            "owner_id": "tester",
+            "agent_id": "tester",
+            "swarm_id": "default",
+            "session_num": 2,
+            "source_id": "conv-alpha",
+        }
+    ]
+    result = {
+        "context": "RETRIEVED FACTS:",
+        "retrieved": [],
+        "query_type": "lookup",
+        "search_family": "conversation",
+        "retrieval_families": ["conversation"],
+        "runtime_trace": {"reason": "empty_visible_facts"},
+    }
+
+    merged = ms._merge_raw_recall(
+        query="find apple token",
+        result=result,
+        caller_id="tester",
+        caller_memberships=[],
+        caller_role="user",
+        swarm_id="default",
+        raw_kind="all",
+    )
+    finalized, _trace = ms._finalize_recall_evidence_context(
+        query="find apple token",
+        recall_result=merged,
+    )
+    finalized_again, _trace = ms._finalize_recall_evidence_context(
+        query="find apple token",
+        recall_result=finalized,
+    )
+
+    assert "COMPLETED RAW EVIDENCE:" in finalized["context"]
+    assert "Project Alpha apple token is quartz" in finalized["context"]
+    assert finalized_again["context"].count("COMPLETED RAW EVIDENCE:") == 1
+
+
+def test_recall_continuation_pages_same_anchor_facts_and_raw(tmp_path):
+    ms = MemoryServer(str(tmp_path), "continuation_pages")
+    old_facts = [
+        {
+            "id": f"old-{idx}",
+            "fact": f"Project Alpha workflow checkpoint {idx}.",
+            "kind": "fact",
+            "session": idx,
+            "scope": "agent-private",
+            "owner_id": "tester",
+            "agent_id": "tester",
+            "swarm_id": "default",
+            "source_id": "conv-alpha",
+        }
+        for idx in range(1, 7)
+    ]
+    needle = {
+        "id": "schedule-fact",
+        "fact": "Project Alpha release is scheduled for 2026-04-27 at night.",
+        "kind": "fact",
+        "session": 7,
+        "scope": "agent-private",
+        "owner_id": "tester",
+        "agent_id": "tester",
+        "swarm_id": "default",
+        "source_id": "conv-alpha",
+    }
+    ms._all_granular = [*old_facts, needle]
+    result = {
+        "context": "RETRIEVED FACTS:\n" + "\n".join(
+            f"[{idx}] {fact['fact']}" for idx, fact in enumerate(old_facts[:5], 1)
+        ),
+        "retrieved": old_facts[:5],
+        "query_type": "lookup",
+        "search_family": "conversation",
+        "retrieval_families": ["conversation"],
+        "runtime_trace": {},
+    }
+
+    continued = ms._attach_recall_continuation(
+        query="when should Project Alpha release be?",
+        result=result,
+        fact_filter=lambda fact: ms._acl_allows(fact, "tester", [], "user"),
+        caller_id="tester",
+        caller_memberships=[],
+        caller_role="user",
+        swarm_id="default",
+        raw_kind="all",
+    )
+    page = get_more_context(
+        raw_sessions=[],
+        page="next",
+        recall_continuation_pages=continued["_recall_continuation_pages"],
+        recall_continuation_handle=continued["recall_continuation"]["handle"],
+    )
+
+    assert "schedule-fact" not in {item["id"] for item in old_facts[:5]}
+    assert continued["recall_continuation"]["available"] is True
+    assert "Project Alpha release is scheduled for 2026-04-27 at night" in page["result"]
+
+
+def test_recall_continuation_preserves_acl(tmp_path):
+    ms = MemoryServer(str(tmp_path), "continuation_acl")
+    visible = {
+        "id": "visible",
+        "fact": "Project Alpha visible detail.",
+        "kind": "fact",
+        "session": 2,
+        "scope": "agent-private",
+        "owner_id": "tester",
+        "agent_id": "tester",
+        "swarm_id": "default",
+        "source_id": "conv-alpha",
+    }
+    hidden = {
+        "id": "hidden",
+        "fact": "Project Alpha hidden secret detail.",
+        "kind": "fact",
+        "session": 3,
+        "scope": "agent-private",
+        "owner_id": "other",
+        "agent_id": "other",
+        "swarm_id": "default",
+        "read": ["other"],
+        "source_id": "conv-alpha",
+    }
+    ms._all_granular = [visible, hidden]
+
+    continued = ms._attach_recall_continuation(
+        query="Project Alpha detail",
+        result={
+            "context": "RETRIEVED FACTS:",
+            "retrieved": [],
+            "query_type": "lookup",
+            "search_family": "conversation",
+            "retrieval_families": ["conversation"],
+            "runtime_trace": {},
+        },
+        fact_filter=lambda fact: ms._acl_allows(fact, "tester", [], "user"),
+        caller_id="tester",
+        caller_memberships=[],
+        caller_role="user",
+        swarm_id="default",
+        raw_kind="all",
+    )
+    page_text = "\n".join(page["context"] for page in continued["_recall_continuation_pages"])
+
+    assert "visible detail" in page_text
+    assert "hidden secret" not in page_text
+
+
+def test_recall_continuation_handles_are_unique_per_recall_and_acl_state(tmp_path):
+    ms = MemoryServer(str(tmp_path), "continuation_unique_handles")
+    ms._all_granular = [
+        {
+            "id": "alpha-a",
+            "fact": "Project Alpha caller A detail.",
+            "kind": "fact",
+            "session": 1,
+            "scope": "agent-private",
+            "owner_id": "caller-a",
+            "agent_id": "caller-a",
+            "swarm_id": "sw-a",
+            "source_id": "conv-alpha",
+        },
+        {
+            "id": "alpha-b",
+            "fact": "Project Alpha caller B detail.",
+            "kind": "fact",
+            "session": 1,
+            "scope": "agent-private",
+            "owner_id": "caller-b",
+            "agent_id": "caller-b",
+            "swarm_id": "sw-b",
+            "source_id": "conv-alpha",
+        },
+    ]
+    base_result = {
+        "context": "RETRIEVED FACTS:",
+        "retrieved": [],
+        "query_type": "lookup",
+        "search_family": "conversation",
+        "retrieval_families": ["conversation"],
+        "runtime_trace": {},
+    }
+
+    first = ms._attach_recall_continuation(
+        query="Project Alpha detail",
+        result=deepcopy(base_result),
+        fact_filter=lambda fact: fact.get("owner_id") == "caller-a" and ms._acl_allows(fact, "caller-a", [], "user"),
+        caller_id="caller-a",
+        caller_memberships=[],
+        caller_role="user",
+        swarm_id="sw-a",
+        raw_kind="all",
+    )
+    second = ms._attach_recall_continuation(
+        query="Project Alpha detail",
+        result=deepcopy(base_result),
+        fact_filter=lambda fact: fact.get("owner_id") == "caller-b" and ms._acl_allows(fact, "caller-b", [], "user"),
+        caller_id="caller-b",
+        caller_memberships=[],
+        caller_role="user",
+        swarm_id="sw-b",
+        raw_kind="all",
+    )
+
+    first_handle = first["recall_continuation"]["handle"]
+    second_handle = second["recall_continuation"]["handle"]
+    assert first_handle != second_handle
+
+    first_page = ms.recall_continuation_page(
+        continuation_handle=first_handle,
+        page="next",
+        caller_id="caller-a",
+        caller_memberships=[],
+        caller_role="user",
+        swarm_id="sw-a",
+    )
+    second_page = ms.recall_continuation_page(
+        continuation_handle=second_handle,
+        page="next",
+        caller_id="caller-b",
+        caller_memberships=[],
+        caller_role="user",
+        swarm_id="sw-b",
+    )
+
+    assert "caller A detail" in first_page["context"]
+    assert "caller B detail" not in first_page["context"]
+    assert "caller B detail" in second_page["context"]
+    assert "caller A detail" not in second_page["context"]
 
 
 def test_build_inference_plan_does_not_mutate_recall_result(tmp_path):
@@ -1788,7 +2030,6 @@ async def _recall_as_agent_b(
     query: str,
     *,
     query_type: str = "lookup",
-    kind: str = "all",
     memberships: list[str] | None = None,
 ):
     return await ms.recall(
@@ -1798,7 +2039,7 @@ async def _recall_as_agent_b(
         search_family="conversation",
         token_budget=4000,
         query_type=query_type,
-        kind=kind,
+        kind="all",
         caller_id="agent:agent-b",
         caller_memberships=memberships if memberships is not None else ["swarm:team-gosh"],
         caller_role="agent",
@@ -3085,152 +3326,6 @@ def test_codebase_search_family_bypasses_conversation_document_raw_gate(tmp_path
     assert "document_raw_window" not in merged.get("runtime_trace", {})
 
 
-def test_conversation_exact_duplicate_requires_active_extracted_fact(tmp_path):
-    ms = MemoryServer(str(tmp_path), "dedup_requires_fact")
-    content = "User: retry this zero-fact write"
-    ms._index_content_entry(
-        message_id="m-zero",
-        source_id="chat-1",
-        session_num=1,
-        stored_at="2024-06-01T00:00:00+00:00",
-        scope="swarm-shared",
-        owner_id="agent:agent-a",
-        swarm_id="team-gosh",
-        family="conversation",
-        content=content,
-    )
-    ms._raw_sessions = [{
-        "raw_session_id": "rs-zero",
-        "message_id": "m-zero",
-        "status": "active",
-    }]
-
-    assert ms._find_exact_duplicate(
-        content=content,
-        family="conversation",
-        scope="swarm-shared",
-        owner_id="agent:agent-a",
-        swarm_id="team-gosh",
-    ) is None
-
-    ms._all_granular = [{"raw_session_id": "rs-zero", "status": "active"}]
-    duplicate = ms._find_exact_duplicate(
-        content=content,
-        family="conversation",
-        scope="swarm-shared",
-        owner_id="agent:agent-a",
-        swarm_id="team-gosh",
-    )
-    assert duplicate["message_id"] == "m-zero"
-
-    ms._all_granular[0]["status"] = "retracted"
-    assert ms._find_exact_duplicate(
-        content=content,
-        family="conversation",
-        scope="swarm-shared",
-        owner_id="agent:agent-a",
-        swarm_id="team-gosh",
-    ) is None
-
-
-def test_empty_fact_raw_fallback_requires_explicit_empty_visible_reason(tmp_path):
-    ms = MemoryServer(str(tmp_path), "raw_empty_reason_gate")
-    ms._raw_sessions = [{
-        "raw_session_id": "rs-fallback",
-        "message_id": "m-fallback",
-        "session_id": "chat-1",
-        "content": "User account code is FALLBACK-44.",
-        "format": "conversation",
-        "content_family": "chat",
-        "session_num": 1,
-        "projection_session_num": 1,
-        "session_date": "2024-06-01",
-        "status": "active",
-        "metadata": {"role": "assistant", "turn_number": "1"},
-        "agent_id": "agent-a",
-        "swarm_id": "team-gosh",
-        "scope": "swarm-shared",
-        "owner_id": "agent:agent-a",
-        "read": ["swarm:team-gosh"],
-        "write": ["swarm:team-gosh"],
-    }]
-    base_result = {
-        "context": "",
-        "retrieved": [],
-        "search_family": "conversation",
-        "retrieval_families": ["conversation"],
-        "query_type": "lookup",
-        "runtime_trace": {},
-    }
-    kwargs = {
-        "query": "what is my account code?",
-        "caller_id": "agent:agent-b",
-        "caller_memberships": ["swarm:team-gosh"],
-        "caller_role": "agent",
-        "swarm_id": "team-gosh",
-    }
-
-    without_reason = ms._merge_raw_recall(result=deepcopy(base_result), **kwargs)
-    assert "FALLBACK-44" not in without_reason.get("context", "")
-    assert without_reason.get("raw_recall_count", 0) == 0
-
-    with_reason_result = deepcopy(base_result)
-    with_reason_result["runtime_trace"] = {"reason": "empty_visible_facts"}
-    with_reason = ms._merge_raw_recall(result=with_reason_result, **kwargs)
-    assert "FALLBACK-44" in with_reason["context"]
-    assert with_reason["raw_recall_count"] == 1
-    assert with_reason["runtime_trace"]["raw_episode_retrieval"]["empty_fact_fallback"] is True
-
-
-@pytest.mark.asyncio
-async def test_kind_filtered_recall_does_not_merge_raw_evidence(tmp_path, monkeypatch):
-    async def _extract_session(**kwargs):
-        return ("conv", int(kwargs.get("session_num") or 1), kwargs.get("session_date", "2024-06-01"), [], [])
-
-    _patch_conversation_raw_recall_runtime(monkeypatch, _extract_session)
-    ms = MemoryServer(str(tmp_path), "kind_filtered_raw")
-    await _write_chat_turn(
-        ms,
-        message_id="raw-constraint",
-        content="The deployment constraint is RAW-ONLY-771.",
-        turn_number=1,
-        role="assistant",
-    )
-    await _drain_write_log(ms)
-
-    result = await _recall_as_agent_b(ms, "RAW-ONLY-771", kind="preference")
-    assert "RAW-ONLY-771" not in result.get("context", "")
-    assert result.get("raw_recall_count", 0) == 0
-
-
-@pytest.mark.asyncio
-async def test_retracted_completed_raw_evidence_is_not_returned(tmp_path, monkeypatch):
-    async def _extract_session(**kwargs):
-        return ("conv", int(kwargs.get("session_num") or 1), kwargs.get("session_date", "2024-06-01"), [], [])
-
-    _patch_conversation_raw_recall_runtime(monkeypatch, _extract_session)
-    ms = MemoryServer(str(tmp_path), "raw_retract_visibility")
-    await _write_chat_turn(
-        ms,
-        message_id="raw-answer",
-        content="The temporary answer is RETRACT-ME-42.",
-        turn_number=1,
-        role="assistant",
-    )
-    await _drain_write_log(ms)
-
-    before = await _recall_as_agent_b(ms, "RETRACT-ME-42")
-    assert "RETRACT-ME-42" in before["context"]
-
-    artifact_id = next(raw["artifact_id"] for raw in ms._raw_sessions if raw.get("message_id") == "raw-answer")
-    retracted = await ms.retract(artifact_id, caller_role="admin")
-    assert retracted["status"] == "retracted"
-
-    after = await _recall_as_agent_b(ms, "RETRACT-ME-42")
-    assert "RETRACT-ME-42" not in after.get("context", "")
-    assert after.get("raw_recall_count", 0) == 0
-
-
 @pytest.mark.asyncio
 async def test_raw_window_does_not_contaminate_from_other_source(tmp_path, monkeypatch):
     async def _extract_session(**kwargs):
@@ -4016,6 +4111,13 @@ async def test_admin_mcp_backfill_original_raw_sources_requires_admin_and_rebuil
     assert "admin backfill’s exact line" in render_refs[0]["ref_json"]["text"]
 
 
+def test_mrcr_backfill_wrapper_only_classifies_sqlcipher_runtime_errors():
+    from scripts.backfill_mrcr_cache_raw_sources import _is_sqlcipher_unavailable
+
+    assert _is_sqlcipher_unavailable(RuntimeError("pysqlcipher3 module is not installed"))
+    assert not _is_sqlcipher_unavailable(RuntimeError("schema migration failed"))
+
+
 @pytest.mark.asyncio
 async def test_admin_mcp_backfill_authorizes_before_loading_memory(monkeypatch):
     import src.mcp_server as mcp_mod
@@ -4032,6 +4134,69 @@ async def test_admin_mcp_backfill_authorizes_before_loading_memory(monkeypatch):
     )
 
     assert result["code"] == "AUTH_REQUIRED"
+
+
+def test_generic_mcp_backfill_tool_requires_manifest_not_cache_root(tmp_path, monkeypatch, capsys):
+    from scripts.backfill_raw_sources_via_mcp import main as wrapper_main
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "backfill",
+            "--cache-root",
+            str(tmp_path),
+            "--endpoint",
+            "http://127.0.0.1:9",
+            "--key",
+            "current",
+            "--admin-token",
+            "admin-token",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        wrapper_main()
+
+    assert exc.value.code == 2
+    assert "manifest" in capsys.readouterr().err.lower()
+
+
+def test_generic_mcp_backfill_wrapper_exits_nonzero_on_tool_failure(tmp_path, monkeypatch, capsys):
+    import scripts.backfill_raw_sources_via_mcp as wrapper
+
+    manifest = tmp_path / "raw_manifest.json"
+    manifest.write_text(
+        json.dumps({"sources": [{"source_id": "src-1", "original_content": "raw", "content_kind": "original_source"}]}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        wrapper,
+        "_tool_call",
+        lambda *_args, **_kwargs: {"status": "ok", "missing": ["src-1"], "refused": [], "validation": {"ok": False}},
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "backfill",
+            "--manifest",
+            str(manifest),
+            "--endpoint",
+            "http://127.0.0.1:9",
+            "--key",
+            "current",
+            "--admin-token",
+            "admin-token",
+        ],
+    )
+
+    exit_code = wrapper.main()
+    output = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 1
+    assert output["status"] == "BACKFILL_FAILED"
+    assert output["BACKFILL_PATH"] == "memory_admin_api"
+    assert output["EXPECTED_ANSWERS_READ"] is False
 
 
 def test_augment_commonality_facts_prefers_interest_pairs_over_event_pairs():

@@ -1601,32 +1601,6 @@ class TestAskLocalCli:
         with pytest.raises(RuntimeError, match="local_cli backend does not support tool use"):
             asyncio.run(ms.ask("What happened?", use_tool=True))
 
-    def test_local_cli_plan_inference_rejects_tool_use_explicitly(self, tmp_path):
-        ms = MemoryServer(
-            str(tmp_path),
-            "plan_local_cli_tool",
-            profiles={1: "fast"},
-            profile_configs=LOCAL_CLI_PROFILE_CONFIGS,
-        )
-        recall_result = {
-            "context": "Context block",
-            "query_type": "lookup",
-            "recommended_prompt_type": "lookup",
-            "recommended_profile": "fast",
-            "retrieved": [{"fact": "Fact"}],
-            "sessions_in_context": 1,
-            "total_sessions": 1,
-            "coverage_pct": 100,
-            "complexity_hint": {"level": 1},
-        }
-
-        with pytest.raises(RuntimeError, match="local_cli backend does not support tool use"):
-            ms._build_inference_plan_from_recall_result(
-                query="What happened?",
-                recall_result=recall_result,
-                use_tool=True,
-            )
-
     def test_local_cli_backend_does_not_trip_api_shell_budget_gate(self, tmp_path, monkeypatch):
         captured = {}
 

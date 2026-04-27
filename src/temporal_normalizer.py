@@ -30,9 +30,22 @@ TEXT_DATE_RE = re.compile(
     re.I,
 )
 YEAR_RE = re.compile(r"\bin\s+(\d{4})\b", re.I)
-AGO_RE = re.compile(r"\b(\d+)\s+(years?|months?|weeks?)\s+ago\b", re.I)
+AGO_RE = re.compile(r"\b(\d+)\s+(years?|months?|weeks?|days?)\s+ago\b", re.I)
+FUTURE_OFFSET_RE = re.compile(
+    r"\b(?:in\s+)?(\d+)\s+(days?|weeks?|months?|years?)\s+(?:from\s+now|later)\b"
+    r"|\bin\s+(\d+)\s+(days?|weeks?|months?|years?)\b",
+    re.I,
+)
 LAST_RE = re.compile(r"\blast\s+(week|month|year)\b", re.I)
 FOR_RE = re.compile(r"\bfor\s+(\d+)\s+(years?|months?|weeks?)\b", re.I)
+DEICTIC_RE = re.compile(r"\b(today|tonight|tomorrow|yesterday|last\s+night)\b", re.I)
+WEEKDAY_RE = re.compile(
+    r"\b(next|this|last)\s+"
+    r"(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+    re.I,
+)
+RELATIVE_PERIOD_RE = re.compile(r"\b(next|this|last)\s+(week|month|year)\b", re.I)
+PART_OF_DAY_RE = re.compile(r"\b(morning|afternoon|evening|night)\b", re.I)
 ORDINAL_HEADER_RE = re.compile(r"^\s*\[?(step|turn|message)\s+\d+\]?:?\s*", re.I)
 ACTION_RE = re.compile(
     r"(?:^|\n)Action:\s*(.+?)(?=(?:\nObservation:|\n[A-Z][A-Za-z _-]+:|\Z))",
@@ -112,11 +125,49 @@ def _iso_date(dt: datetime) -> str:
 
 def _approx_shift(anchor: datetime, amount: int, unit: str) -> datetime:
     unit = unit.lower()
+    if unit.startswith("day"):
+        return anchor - timedelta(days=amount)
     if unit.startswith("week"):
         return anchor - timedelta(weeks=amount)
     if unit.startswith("month"):
         return anchor - timedelta(days=30 * amount)
     return anchor - timedelta(days=365 * amount)
+
+
+def _approx_shift_future(anchor: datetime, amount: int, unit: str) -> datetime:
+    unit = unit.lower()
+    if unit.startswith("day"):
+        return anchor + timedelta(days=amount)
+    if unit.startswith("week"):
+        return anchor + timedelta(weeks=amount)
+    if unit.startswith("month"):
+        return anchor + timedelta(days=30 * amount)
+    return anchor + timedelta(days=365 * amount)
+
+
+def _weekday_index(name: str) -> int:
+    return {
+        "monday": 0,
+        "tuesday": 1,
+        "wednesday": 2,
+        "thursday": 3,
+        "friday": 4,
+        "saturday": 5,
+        "sunday": 6,
+    }[name.lower()]
+
+
+def _resolve_relative_weekday(anchor: datetime, direction: str, weekday: str) -> datetime:
+    target = _weekday_index(weekday)
+    current = anchor.weekday()
+    direction = direction.lower()
+    if direction == "last":
+        delta = (current - target) % 7 or 7
+        return anchor - timedelta(days=delta)
+    delta = (target - current) % 7
+    if direction == "next" and delta == 0:
+        delta = 7
+    return anchor + timedelta(days=delta)
 
 
 def _calendar_payload(
@@ -143,6 +194,74 @@ def _calendar_payload(
         year = int(match.group(1))
         return (match.group(0), "interval", f"{year:04d}-01-01", f"{year:04d}-12-31", "year")
     anchor = _parse_anchor_datetime(timestamp)
+    match = DEICTIC_RE.search(lower)
+    if match and anchor is not None:
+        phrase = match.group(1)
+        normalized = re.sub(r"\s+", " ", phrase.lower()).strip()
+        if normalized in {"today", "tonight"}:
+            resolved = anchor
+        elif normalized == "tomorrow":
+            resolved = anchor + timedelta(days=1)
+        elif normalized in {"yesterday", "last night"}:
+            resolved = anchor - timedelta(days=1)
+        else:
+            resolved = anchor
+        return (
+            match.group(0),
+            "point",
+            _iso_date(resolved),
+            _iso_date(resolved),
+            "day",
+        )
+    match = FUTURE_OFFSET_RE.search(lower)
+    if match and anchor is not None:
+        amount = int(match.group(1) or match.group(3))
+        unit = match.group(2) or match.group(4)
+        resolved = _approx_shift_future(anchor, amount, unit)
+        granularity = "year" if unit.lower().startswith("year") else "month" if unit.lower().startswith("month") else "day"
+        return (match.group(0), "point", _iso_date(resolved), _iso_date(resolved), granularity)
+    match = WEEKDAY_RE.search(lower)
+    if match and anchor is not None:
+        resolved = _resolve_relative_weekday(anchor, match.group(1), match.group(2))
+        return (match.group(0), "point", _iso_date(resolved), _iso_date(resolved), "day")
+    match = RELATIVE_PERIOD_RE.search(lower)
+    if match and anchor is not None:
+        direction = match.group(1).lower()
+        unit = match.group(2).lower()
+        if unit == "week":
+            if direction == "last":
+                end = anchor - timedelta(days=1)
+                start = end - timedelta(days=6)
+            elif direction == "next":
+                start = anchor + timedelta(days=1)
+                end = start + timedelta(days=6)
+            else:
+                start = anchor - timedelta(days=anchor.weekday())
+                end = start + timedelta(days=6)
+            granularity = "day"
+        elif unit == "month":
+            if direction == "last":
+                end = anchor - timedelta(days=1)
+                start = end - timedelta(days=29)
+            elif direction == "next":
+                start = anchor + timedelta(days=1)
+                end = start + timedelta(days=29)
+            else:
+                start = anchor.replace(day=1)
+                end = start + timedelta(days=30)
+            granularity = "month"
+        else:
+            if direction == "last":
+                end = anchor - timedelta(days=1)
+                start = end - timedelta(days=364)
+            elif direction == "next":
+                start = anchor + timedelta(days=1)
+                end = start + timedelta(days=364)
+            else:
+                start = anchor.replace(month=1, day=1)
+                end = start.replace(month=12, day=31)
+            granularity = "year"
+        return (match.group(0), "interval", _iso_date(start), _iso_date(end), granularity)
     match = AGO_RE.search(lower)
     if match and anchor is not None:
         amount = int(match.group(1))
@@ -175,6 +294,9 @@ def _calendar_payload(
         end = anchor
         granularity = "year" if unit.lower().startswith("year") else "month" if unit.lower().startswith("month") else "day"
         return (match.group(0), "duration", _iso_date(start), _iso_date(end), granularity)
+    match = PART_OF_DAY_RE.search(lower)
+    if match and anchor is not None:
+        return (match.group(0), "point", _iso_date(anchor), _iso_date(anchor), "day")
     return (None, None, None, None, None)
 
 

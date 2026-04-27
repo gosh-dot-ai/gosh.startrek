@@ -66,6 +66,35 @@ def test_memory_recall_docstring_describes_iterative_codebase_recall():
     assert "lookup: exact file/symbol/config/test lookup" in doc
 
 
+def test_startup_log_lines_redact_server_token():
+    token = "live-token-that-must-not-leak"
+    lines = mod.startup_log_lines(
+        title="gosh.memory MCP Server",
+        listening="http://127.0.0.1:8765",
+        data_dir="/data",
+        embeddings="openai / text-embedding-3-large",
+        tls="off",
+        token=token,
+        token_path="/root/.gosh-memory/token",
+    )
+    rendered = "\n".join(lines)
+
+    assert token not in rendered
+    assert "Token fingerprint: sha256:" in rendered
+    assert "Token saved to: /root/.gosh-memory/token" in rendered
+    assert "%(asctime)s" in mod.STARTUP_LOG_FORMAT
+
+
+def test_token_fingerprint_is_stable_and_non_secret():
+    token = "another-live-token"
+    first = mod.token_fingerprint(token)
+    second = mod.token_fingerprint(token)
+
+    assert first == second
+    assert first.startswith("sha256:")
+    assert token not in first
+
+
 # ── Patches ──
 
 def _patch_extraction(monkeypatch):
@@ -1056,6 +1085,18 @@ def test_memory_recall_omits_inference_planning_hints_from_mcp_response(monkeypa
             "payload_meta": {"profile_used": "fast"},
             "_payload_secret_ref": {"name": "hidden-secret", "scope": "system-wide"},
             "secret_ref": {"name": "hidden-secret", "scope": "system-wide"},
+            "recall_continuation": {
+                "available": True,
+                "handle": "opaque",
+                "next_page": 2,
+                "page_size": 5,
+                "candidate_count": 6,
+                "returned_count": 5,
+                "exhausted": False,
+                "anchor_terms": ["storage"],
+                "tool": "get_more_context",
+                "tool_usage": "call get_more_context with page=\"next\" or without session_id to fetch the next evidence page",
+            },
         }
 
     monkeypatch.setattr(server, "recall", fake_recall)
@@ -1073,6 +1114,100 @@ def test_memory_recall_omits_inference_planning_hints_from_mcp_response(monkeypa
     assert "payload_meta" not in result
     assert "_payload_secret_ref" not in result
     assert "secret_ref" not in result
+    assert result["recall_continuation"]["available"] is True
+    assert result["recall_continuation"]["handle"] == "opaque"
+    assert result["recall_continuation"]["tool"] == "memory_recall"
+    assert result["recall_continuation"]["mcp_tool"] == "memory_recall"
+    assert "get_more_context" not in result["recall_continuation"]["tool_usage"]
+
+
+def test_memory_recall_public_continuation_pages_through_memory_recall(monkeypatch):
+    writer_token = _principal_token("recall-continuation-writer")
+    asyncio.run(memory_store(
+        key="recall_public_continuation",
+        content="Project Alpha workflow checkpoint.",
+        session_num=1,
+        session_date="2024-06-01",
+        scope="agent-private",
+        token=writer_token,
+    ))
+    server = mod.registry["recall_public_continuation"]
+
+    async def fake_recall(**_kwargs):
+        return {
+            "context": (
+                "RETRIEVED FACTS:\n- Project Alpha workflow checkpoint.\n\n"
+                "RECALL CONTINUATION AVAILABLE:\n"
+                "More evidence matches anchors ['project', 'alpha']. "
+                "If the answer is not in this page, call get_more_context with page=\"next\" "
+                "or without session_id to retrieve the next evidence page."
+            ),
+            "retrieved": [],
+            "query_type": "lookup",
+            "runtime_trace": {"evidence_context": {"finalized": True}},
+            "_recall_continuation_pages": [
+                {
+                    "page": 2,
+                    "next_page": None,
+                    "exhausted": True,
+                    "context": "RECALL CONTINUATION PAGE 2:\nRETRIEVED FACTS:\n- Project Alpha ships Friday.",
+                    "returned_count": 1,
+                }
+            ],
+            "recall_continuation": {
+                "available": True,
+                "handle": "opaque-public",
+                "next_page": 2,
+                "page_size": 5,
+                "candidate_count": 6,
+                "returned_count": 5,
+                "exhausted": False,
+                "anchor_terms": ["project", "alpha"],
+                "tool": "get_more_context",
+                "tool_usage": "call get_more_context with page=\"next\" or without session_id to fetch the next evidence page",
+            },
+            "answer_contract": {
+                "prompt_template": "Context:\n{context}\nIf missing, call get_more_context with page=\"next\" or without session_id to fetch the next evidence page.",
+                "variables": {},
+                "recall_continuation": {
+                    "available": True,
+                    "tool": "get_more_context",
+                    "handle": "opaque-public",
+                    "next_page": 2,
+                    "instruction": "call get_more_context with page=\"next\" or no session_id to fetch the next page.",
+                },
+            },
+        }
+
+    monkeypatch.setattr(server, "recall", fake_recall)
+
+    first = asyncio.run(memory_recall(
+        key="recall_public_continuation",
+        query="When does Project Alpha ship?",
+        token=writer_token,
+    ))
+
+    assert first["recall_continuation"]["tool"] == "memory_recall"
+    assert first["recall_continuation"]["mcp_tool"] == "memory_recall"
+    assert "continuation_handle=\"opaque-public\"" in first["context"]
+    assert "get_more_context" not in first["context"]
+    assert first["answer_contract"]["recall_continuation"]["tool"] == "memory_recall"
+    assert "get_more_context" not in first["answer_contract"]["recall_continuation"]["instruction"]
+    assert "get_more_context" not in first["answer_contract"]["prompt_template"]
+
+    second = asyncio.run(memory_recall(
+        key="recall_public_continuation",
+        continuation_handle="opaque-public",
+        page="next",
+        token=writer_token,
+    ))
+
+    assert "Project Alpha ships Friday" in second["context"]
+    assert second["query_type"] == "continuation"
+    assert second["recall_continuation"]["handle"] == "opaque-public"
+    assert second["recall_continuation"]["exhausted"] is True
+    assert "payload" not in second
+    assert "payload_meta" not in second
 
 
 def test_memory_write_exposes_raw_recall_and_status(tmp_path):

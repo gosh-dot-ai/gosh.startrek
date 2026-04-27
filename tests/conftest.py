@@ -10,10 +10,7 @@ from copy import deepcopy
 
 import pytest
 
-from tests._archive_repo import ensure_archive_repo_on_sys_path
 from src.memory import MemoryServer
-
-ensure_archive_repo_on_sys_path(auto_clone=False)
 
 
 _TEST_RUNTIME_SECRET_REFS = {

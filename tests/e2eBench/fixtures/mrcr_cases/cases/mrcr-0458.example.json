@@ -1,6 +1,6 @@
 {
   "example_id": "mrcr-0458",
-  "benchmark_id": "mrcr_v2_r1776369412_mrcr-0458",
+  "benchmark_key": "mrcr_v2_r1776369412_mrcr-0458",
   "query": {
     "id": "mrcr-0458",
     "query": "Prepend YQwhQ33OZn to the 2nd (1 indexed) song about plums. Do not include any other text in your response.",
