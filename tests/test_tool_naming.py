@@ -27,7 +27,7 @@ def test_required_tools_registered():
     tools = asyncio.run(mcp.list_tools())
     tool_names = {t.name for t in tools}
     required = {
-        "memory_store", "memory_recall", "memory_plan_inference", "memory_ingest_document", "memory_ingest",
+        "memory_store", "memory_recall", "get_more_context", "memory_plan_inference", "memory_ingest_document", "memory_ingest",
         "memory_build_index", "memory_flush", "memory_migrate_jsonnpz", "memory_stats",
         "memory_reextract", "memory_list", "memory_get",
         "memory_import",

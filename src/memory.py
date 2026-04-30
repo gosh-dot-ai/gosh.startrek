@@ -41,6 +41,7 @@ from .codebase_semantic_runtime import (
     promote_defining_code_facts,
     query_requests_precise_code,
 )
+from .codebase_semantic_sidecars import CodebaseSemanticSidecarStore
 from .common import (
     STOP_WORDS,
     _api_model,
@@ -305,6 +306,96 @@ _CITY_TO_COUNTRY = {
     "vancouver": "Canada",
     "washington": "United States",
 }
+
+
+_ANSWER_CITATION_PARENS_RE = re.compile(
+    r"\(\s*(?:evidence|source|sources|citation|citations|fact|retrieved\s+fact[s]?|ref|refs|reference|references)"
+    r"[^\)]*\)",
+    re.IGNORECASE,
+)
+_ANSWER_CITATION_TAIL_RE = re.compile(
+    r"\b(?:sources?|evidence|citations?|references?)\s*:\s*.*$",
+    re.IGNORECASE | re.DOTALL,
+)
+_ANSWER_ACCORDING_TO_RE = re.compile(
+    r"^\s*according\s+to[^,.\n]*[,.\n]?",
+    re.IGNORECASE,
+)
+_ANSWER_BRACKET_REF_RE = re.compile(r"\[\s*\d+(?:\s*[-,]\s*\d+)*\s*\]")
+_ANSWER_PAREN_SESSION_REF_RE = re.compile(
+    r"\(\s*(?:S|Session|Sess|Fact|fact|F|sess)\s*\d+\b[^\)]*\)",
+    re.IGNORECASE,
+)
+_ANSWER_META_EXPLANATION_TAIL_RE = re.compile(
+    r"\b(?:as\s+(?:noted|confirmed|stated|mentioned|cited)\s+in|"
+    r"explicitly\s+(?:states?|stated|noted|confirmed|mentioned)|"
+    r"as\s+per\s+(?:the\s+)?(?:retrieved\s+)?fact[s]?|"
+    r"this\s+is\s+(?:explicitly\s+)?(?:stated|noted|confirmed)\s+in)\b[^.\n]*[.\n]?",
+    re.IGNORECASE,
+)
+
+
+_GROUNDED_GATE_MONTH_NAMES = {
+    "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december",
+    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
+}
+_GROUNDED_GATE_WEEKDAY_NAMES = {
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "mon", "tue", "wed", "thu", "fri", "sat", "sun",
+}
+_GROUNDED_GATE_DATE_COMPONENT_TOKENS = (
+    _GROUNDED_GATE_MONTH_NAMES | _GROUNDED_GATE_WEEKDAY_NAMES
+)
+
+
+def _answer_core_for_grounding(answer: str) -> str:
+    """Strip citation/source/explanation wrappers from a model answer.
+
+    Instruction-tuned models routinely append evidence citations and
+    meta-explanation tails to a substantively correct answer, e.g.::
+
+        John signed with the Minnesota Wolves on 21 May 2023.
+        Sources: [1] (S1) explicitly states ...
+
+    or::
+
+        Evan got a new Prius after his old Prius broke down.
+        (Evidence: [1][2][5][7] explicitly state he repaired/sold the old Prius.)
+
+    The grounding gate downstream tokenises the answer and rejects it if
+    any token is missing from the retrieved evidence text. Citation and
+    meta-explanation wording (``Sources:``, ``Evidence: [1]``,
+    ``explicitly states``, ``[2]``) is by construction absent from raw
+    evidence — so without stripping it, every answer that cites its
+    sources gets falsely classified as ungrounded.
+
+    This helper removes:
+
+    - ``(Evidence: [1][2] ...)`` / ``(Sources: ...)`` parenthesised tails
+    - trailing ``Sources: ...`` / ``Evidence: ...`` / ``Citations: ...``
+      / ``References: ...`` blocks
+    - leading ``According to ...`` clauses
+    - bracket session/fact refs ``[1]``, ``[2-3]``
+    - parenthesised session refs ``(S5)``, ``(Fact 12)``
+    - trailing ``as noted in / explicitly states / as per the retrieved
+      fact ...`` meta-explanation clauses
+
+    The remaining text is the *answer core* the gate must judge.
+    Hallucinations (fabricated content with no support) still produce
+    zero grounded tokens after this strip and are rejected by the gate
+    as before.
+    """
+    if not answer:
+        return ""
+    text = answer
+    text = _ANSWER_CITATION_PARENS_RE.sub(" ", text)
+    text = _ANSWER_CITATION_TAIL_RE.sub(" ", text)
+    text = _ANSWER_ACCORDING_TO_RE.sub(" ", text)
+    text = _ANSWER_PAREN_SESSION_REF_RE.sub(" ", text)
+    text = _ANSWER_BRACKET_REF_RE.sub(" ", text)
+    text = _ANSWER_META_EXPLANATION_TAIL_RE.sub(" ", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _normalize_commonality_token(token: str) -> str:
@@ -8991,6 +9082,7 @@ class MemoryServer:
         query_type: str = "auto",
         query_metadata: dict[str, Any] | None = None,
         path_constraint_query: str | None = None,
+        codebase_probe_mode: bool = False,
     ) -> dict:
         resolved_type = self._QUERY_TYPE_MAP.get(query_type) or detect_query_type(query)
         retrieval_target = (extract_query_features(query).get("retrieval_target") or query)
@@ -9145,7 +9237,7 @@ class MemoryServer:
                 or repo_task_metadata.get("task_mode") == "patch_generation"
                 or repo_task_metadata.get("output_artifact") == "unified_diff"
             )
-            if repo_contract_active:
+            if repo_contract_active and not codebase_probe_mode:
                 metadata_source_id = str(
                     repo_task_metadata.get("source_id")
                     or repo_task_metadata.get("work_item_id")
@@ -9282,20 +9374,22 @@ class MemoryServer:
         )
         codebase_structural_context: str | None = None
         codebase_structural_trace: dict[str, Any] | None = None
-        codebase_graph_source_ids = {
-            str(fact.get("source_id") or (fact.get("metadata") or {}).get("episode_source_id") or "").strip()
-            for fact in resolved_facts
-            if self._fact_source_family(fact) == "codebase"
-            and str(
-                (
-                    (self._source_records.get(
-                        str(fact.get("source_id") or (fact.get("metadata") or {}).get("episode_source_id") or "").strip()
-                    ) or {}).get("source_meta")
-                    or {}
-                ).get("codebase_graph_ref")
-                or ""
-            ).strip()
-        }
+        codebase_graph_source_ids = set()
+        if not codebase_probe_mode:
+            codebase_graph_source_ids = {
+                str(fact.get("source_id") or (fact.get("metadata") or {}).get("episode_source_id") or "").strip()
+                for fact in resolved_facts
+                if self._fact_source_family(fact) == "codebase"
+                and str(
+                    (
+                        (self._source_records.get(
+                            str(fact.get("source_id") or (fact.get("metadata") or {}).get("episode_source_id") or "").strip()
+                        ) or {}).get("source_meta")
+                        or {}
+                    ).get("codebase_graph_ref")
+                    or ""
+                ).strip()
+            }
         if codebase_graph_source_ids:
             structural_packet = {
                 "retrieved_episode_ids": list(
@@ -9371,7 +9465,10 @@ class MemoryServer:
         codebase_context = None
         codebase_context_trace = {"mode": "inactive", "reason": "not_codebase_query"}
         repo_task_query_context_pack = None
-        if search_family == "codebase" or any(self._fact_source_family(fact) == "codebase" for fact in resolved_facts):
+        if (
+            not codebase_probe_mode
+            and (search_family == "codebase" or any(self._fact_source_family(fact) == "codebase" for fact in resolved_facts))
+        ):
             visible_codebase_source_ids = {
                 str(fact.get("source_id") or (fact.get("metadata") or {}).get("episode_source_id") or "").strip()
                 for fact in candidate_facts
@@ -10227,6 +10324,391 @@ class MemoryServer:
                 if fact_id and fact_id not in lookup:
                     lookup[fact_id] = fact
         return lookup
+
+    def _visible_source_families(self, fact_filter) -> list[str]:
+        families: list[str] = []
+        seen: set[str] = set()
+        for facts in (self._all_granular, self._all_cons, self._all_cross):
+            for fact in facts:
+                if not fact_filter(fact):
+                    continue
+                family = self._fact_source_family(fact)
+                if family and family not in seen:
+                    seen.add(family)
+                    families.append(family)
+        return families
+
+    @staticmethod
+    def _auto_discovery_query_tokens(query: str) -> set[str]:
+        tokens: set[str] = set()
+        for raw in re.findall(r"[A-Za-z0-9]+", str(query or "").lower()):
+            token = normalize_term_token(raw)
+            if not token or token in STOP_WORDS:
+                continue
+            tokens.add(token)
+        return tokens
+
+    @staticmethod
+    def _auto_discovery_fact_text(fact: dict[str, Any]) -> str:
+        metadata_raw = fact.get("metadata")
+        metadata = cast(dict[str, Any], metadata_raw) if isinstance(metadata_raw, dict) else {}
+        codebase_raw = metadata.get("codebase")
+        codebase = cast(dict[str, Any], codebase_raw) if isinstance(codebase_raw, dict) else {}
+        parts: list[str] = [
+            str(fact.get("id") or ""),
+            str(fact.get("kind") or ""),
+            str(fact.get("fact") or ""),
+            str(fact.get("source_id") or metadata.get("episode_source_id") or ""),
+            str(fact.get("file_path") or metadata.get("file_path") or ""),
+            str(fact.get("language") or metadata.get("language") or ""),
+            str(fact.get("semantic_kind") or metadata.get("semantic_kind") or ""),
+            str(fact.get("semantic_type") or metadata.get("semantic_type") or ""),
+        ]
+        for key in (
+            "object_id",
+            "relation_type",
+            "qualified_name",
+            "name",
+            "path",
+            "kind_fq",
+            "anchor",
+        ):
+            value = codebase.get(key)
+            if value:
+                parts.append(str(value))
+        for key in ("entities", "tags"):
+            value = fact.get(key) or metadata.get(key)
+            if isinstance(value, list):
+                parts.extend(str(item) for item in value)
+            elif value:
+                parts.append(str(value))
+        return "\n".join(part for part in parts if part)
+
+    def _score_auto_codebase_candidate(
+        self,
+        *,
+        query: str,
+        query_tokens: set[str],
+        fact: dict[str, Any],
+        retrieval_score: float,
+    ) -> dict[str, Any]:
+        haystack = self._auto_discovery_fact_text(fact)
+        haystack_lower = haystack.lower()
+        fact_tokens = self._auto_discovery_query_tokens(haystack)
+        overlap_tokens = sorted(query_tokens & fact_tokens)
+        normalized_query = " ".join(
+            raw
+            for raw in re.findall(r"[A-Za-z0-9_./:-]+", str(query or "").lower())
+            if normalize_term_token(raw) and normalize_term_token(raw) not in STOP_WORDS
+        )
+        phrase_match = bool(normalized_query and normalized_query in haystack_lower)
+        score = float(len(overlap_tokens))
+        if phrase_match:
+            score += 4.0
+        return {
+            "fact_id": str(fact.get("id") or ""),
+            "score": score,
+            "retrieval_score": float(retrieval_score),
+            "overlap_count": len(overlap_tokens),
+            "overlap_tokens": overlap_tokens,
+            "phrase_match": phrase_match,
+        }
+
+    @staticmethod
+    def _source_hydration_trace(
+        code_trace: dict[str, Any] | None,
+        *,
+        code_query_mode: str,
+        default_reason: str | None = None,
+    ) -> dict[str, Any]:
+        trace = dict(code_trace or {})
+        mode = str(trace.get("mode") or "inactive")
+        hydrated = mode in {"whole_file", "windowed_file"}
+        reason = str(trace.get("reason") or default_reason or "")
+        if hydrated and not reason:
+            reason = "query_requires_code_hydration"
+        if not hydrated and not reason:
+            reason = "source_hydration_not_required"
+        return {
+            "hydrated": hydrated,
+            "mode": mode,
+            "reason": reason,
+            "code_query_mode": code_query_mode,
+            "selected_file": trace.get("selected_file"),
+            "selected_fact_ids": trace.get("selected_fact_ids", []),
+        }
+
+    def _family_discovery_trace(
+        self,
+        *,
+        fact_filter,
+        requested_search_family: str | None,
+        searched_families: list[str] | None,
+        selected_facts: list[dict[str, Any]],
+        code_query_mode: str,
+        merged_families: list[str] | None = None,
+        codebase_probe_trace: dict[str, Any] | None = None,
+        codebase_augmentation_trace: dict[str, Any] | None = None,
+        episode_first_pass_trace: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        requested = str(requested_search_family or "auto").strip().lower() or "auto"
+        available = self._visible_source_families(fact_filter)
+        available_set = set(available)
+        searched_set = {
+            str(family or "").strip().lower()
+            for family in (searched_families or [])
+            if str(family or "").strip()
+        }
+        if codebase_probe_trace and codebase_probe_trace.get("searched"):
+            searched_set.add("codebase")
+        selected_ids_by_family: dict[str, list[str]] = defaultdict(list)
+        for fact in selected_facts:
+            family = self._fact_source_family(fact)
+            fact_id = str(fact.get("id") or "").strip()
+            if family and fact_id and fact_id not in selected_ids_by_family[family]:
+                selected_ids_by_family[family].append(fact_id)
+
+        selected_family_set = set(selected_ids_by_family)
+        merged = list(dict.fromkeys(
+            family
+            for family in (merged_families or [*searched_set, *selected_family_set])
+            if family
+        ))
+        candidate_counts: dict[str, int] = defaultdict(int)
+        first_pass = episode_first_pass_trace or {}
+        for row in first_pass.get("per_family") or []:
+            family = str(row.get("family") or "").strip().lower()
+            if family:
+                candidate_counts[family] = int(row.get("candidate_count") or 0)
+
+        family_names = sorted(
+            available_set
+            | searched_set
+            | selected_family_set
+            | ({requested} if requested not in {"", "auto"} else set())
+            | ({"codebase"} if requested == "auto" or codebase_probe_trace else set())
+        )
+        per_family: dict[str, dict[str, Any]] = {}
+        for family in family_names:
+            available_family = family in available_set
+            searched_family = family in searched_set
+            selected_ids = selected_ids_by_family.get(family, [])
+            mode = "not_available"
+            skipped_reason = None
+            candidate_count = int(candidate_counts.get(family, 0))
+            if family == "codebase" and codebase_probe_trace is not None:
+                probe = dict(codebase_probe_trace)
+                per_family[family] = {
+                    "available": bool(probe.get("available", available_family)),
+                    "searched": bool(probe.get("searched", searched_family)),
+                    "candidate_count": int(probe.get("candidate_count") or 0),
+                    "visible_fact_count": int(probe.get("visible_fact_count") or 0),
+                    "selected_count": int(probe.get("selected_count") or 0),
+                    "selected_fact_ids": list(probe.get("selected_fact_ids") or []),
+                    "skipped_reason": probe.get("skipped_reason"),
+                    "mode": str(probe.get("mode") or "codebase_cheap_probe"),
+                    "score_summary": probe.get("score_summary", {}),
+                }
+                continue
+            if available_family and searched_family:
+                mode = "episode_primary"
+            elif available_family:
+                mode = "not_searched"
+                skipped_reason = "explicit_family_filter" if requested not in {"", "auto", family} else "not_selected_by_auto_routing"
+            if family == "codebase" and searched_family:
+                mode = "explicit_codebase" if requested == "codebase" else "auto_codebase"
+            if not available_family:
+                skipped_reason = "not_available"
+            elif searched_family and not selected_ids and not skipped_reason:
+                skipped_reason = "no_selected_evidence"
+            per_family[family] = {
+                "available": available_family,
+                "searched": searched_family,
+                "candidate_count": candidate_count,
+                "selected_count": len(selected_ids),
+                "selected_fact_ids": selected_ids[:12],
+                "skipped_reason": skipped_reason,
+                "mode": mode,
+            }
+
+        source_hydration = self._source_hydration_trace(
+            codebase_augmentation_trace,
+            code_query_mode=code_query_mode,
+        )
+        if codebase_probe_trace and not source_hydration["hydrated"]:
+            source_hydration = dict(codebase_probe_trace.get("source_hydration") or source_hydration)
+        return {
+            "available_families": available,
+            "searched_families": sorted(searched_set),
+            "per_family": per_family,
+            "merged_families": merged,
+            "source_hydration": source_hydration,
+        }
+
+    async def _auto_discover_codebase_evidence(
+        self,
+        *,
+        query: str,
+        query_type: str,
+        query_metadata: dict[str, Any] | None,
+        fact_filter,
+        episode_facts: list[dict[str, Any]],
+        code_query_mode: str,
+    ) -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
+        threshold: dict[str, Any] = {
+            "min_score": 1.0,
+            "min_overlap": 1,
+            "exact_phrase_bonus": 4.0,
+            "selected_limit": 6,
+            "policy": "token_overlap_or_exact_phrase",
+        }
+        trace: dict[str, Any] = {
+            "available": False,
+            "searched": False,
+            "candidate_count": 0,
+            "selected_count": 0,
+            "selected_fact_ids": [],
+            "mode": "codebase_cheap_probe",
+            "threshold": threshold,
+            "score_summary": {"threshold": threshold, "accepted": [], "rejected": []},
+            "source_hydration": self._source_hydration_trace(
+                {"mode": "hot_only", "reason": "generic_auto_discovery_facts_only"},
+                code_query_mode=code_query_mode,
+            ),
+        }
+        code_lookup = self._visible_fact_lookup(fact_filter, search_family="codebase")
+        if not code_lookup:
+            trace["skipped_reason"] = "no_visible_codebase_facts"
+            return [], "", trace
+
+        query_tokens = self._auto_discovery_query_tokens(query)
+        trace["available"] = True
+        trace["visible_fact_count"] = len(code_lookup)
+        if not query_tokens:
+            trace["skipped_reason"] = "no_meaningful_query_tokens"
+            return [], "", trace
+        min_overlap = 1 if len(query_tokens) <= 1 else 2
+        threshold = {
+            **threshold,
+            "min_score": float(min_overlap),
+            "min_overlap": min_overlap,
+        }
+        trace["threshold"] = threshold
+        trace["score_summary"]["threshold"] = threshold
+
+        codebase_result = await self._generic_fact_recall(
+            query=query,
+            fact_filter=fact_filter,
+            search_family="codebase",
+            query_type=query_type,
+            query_metadata=query_metadata,
+            codebase_probe_mode=True,
+        )
+        trace["searched"] = True
+        trace["probe_runtime_reason"] = (codebase_result.get("runtime_trace") or {}).get("reason")
+        retrieval_scores: dict[str, float] = {}
+        candidate_facts: list[dict[str, Any]] = []
+        seen_candidate_ids: set[str] = set()
+        for item in codebase_result.get("retrieved", []) or []:
+            if not isinstance(item, dict):
+                continue
+            fact_id = str(item.get("fact_id") or item.get("id") or "").strip()
+            if not fact_id or fact_id in seen_candidate_ids or fact_id not in code_lookup:
+                continue
+            seen_candidate_ids.add(fact_id)
+            retrieval_scores[fact_id] = float(item.get("sim") or item.get("score") or 0.0)
+            candidate_facts.append(code_lookup[fact_id])
+        trace["candidate_count"] = len(candidate_facts)
+        if not candidate_facts:
+            trace["skipped_reason"] = "no_probe_candidates"
+            return [], "", trace
+
+        scored_rows = [
+            self._score_auto_codebase_candidate(
+                query=query,
+                query_tokens=query_tokens,
+                fact=fact,
+                retrieval_score=retrieval_scores.get(str(fact.get("id") or ""), 0.0),
+            )
+            for fact in candidate_facts
+        ]
+        scored_rows.sort(
+            key=lambda row: (
+                -float(row["score"]),
+                -float(row["retrieval_score"]),
+                str(row["fact_id"]),
+            )
+        )
+        accepted = [
+            row
+            for row in scored_rows
+            if float(row["score"]) >= float(threshold["min_score"])
+            and (
+                int(row["overlap_count"]) >= int(threshold["min_overlap"])
+                or bool(row["phrase_match"])
+            )
+        ]
+        selected_ids = [
+            str(row["fact_id"])
+            for row in accepted[: int(threshold["selected_limit"])]
+            if str(row.get("fact_id") or "")
+        ]
+        selected_id_set = set(selected_ids)
+        selected_facts = [
+            fact
+            for fact in candidate_facts
+            if str(fact.get("id") or "") in selected_id_set
+        ]
+        selected_facts.sort(key=lambda fact: selected_ids.index(str(fact.get("id") or "")))
+        trace["selected_count"] = len(selected_facts)
+        trace["selected_fact_ids"] = selected_ids
+        trace["score_summary"] = {
+            "threshold": threshold,
+            "query_tokens": sorted(query_tokens),
+            "accepted": accepted[: int(threshold["selected_limit"])],
+            "rejected": [
+                {
+                    **row,
+                    "reason": "below_overlap_threshold",
+                }
+                for row in scored_rows
+                if str(row.get("fact_id") or "") not in selected_id_set
+            ][:8],
+        }
+        if not selected_facts:
+            trace["skipped_reason"] = "filtered_below_overlap_threshold"
+            return [], "", trace
+
+        code_packet = _build_context_packet(
+            selected_facts,
+            self._raw_sessions,
+            budget=0,
+            raw_docs=None,
+        )
+        code_fact_lines = _context_packet_fact_lines(code_packet)
+        if not code_fact_lines:
+            code_fact_lines = [
+                f"- {str(fact.get('fact') or '').strip()}"
+                for fact in selected_facts
+                if str(fact.get("fact") or "").strip()
+            ]
+        rendered = ""
+        if code_fact_lines:
+            rendered = "--- CODEBASE FACTS ---\n" + "\n".join(code_fact_lines)
+
+        if code_query_mode in {"precise_code", "mixed_code_plus_prose"}:
+            code_segments, code_trace = augment_codebase_context(
+                query=query,
+                retrieved_facts=[*episode_facts, *selected_facts],
+                data_dir=str(self.data_dir),
+            )
+            trace["source_hydration"] = self._source_hydration_trace(
+                code_trace,
+                code_query_mode=code_query_mode,
+            )
+            if code_segments:
+                rendered = f"{rendered.rstrip()}\n\n{_render_code_attachment_block(code_segments)}".strip()
+        return selected_facts, rendered, trace
 
     async def _merge_auto_mixed_codebase_result(
         self,
@@ -11836,31 +12318,381 @@ class MemoryServer:
                 score += 1.0 + min(text.count(normalized), 3) * 0.1
         return score
 
-    def _render_recall_continuation_page(self, items: list[dict], *, page_num: int) -> str:
-        fact_lines: list[str] = []
-        raw_items: list[dict] = []
-        for item in items:
-            if item.get("candidate_kind") == "raw":
-                raw = dict(item.get("item") or {})
-                if raw:
-                    raw_items.append(raw)
+    @staticmethod
+    def _typed_continuation_entry_counts(entries: list[dict]) -> dict[str, int]:
+        counts: dict[str, int] = defaultdict(int)
+        for entry in entries:
+            entry_type = str(entry.get("type") or "unknown").strip() or "unknown"
+            counts[entry_type] += 1
+        return dict(sorted(counts.items()))
+
+    @staticmethod
+    def _typed_continuation_families(entries: list[dict]) -> list[str]:
+        return list(dict.fromkeys(
+            str(entry.get("family") or "").strip()
+            for entry in entries
+            if str(entry.get("family") or "").strip()
+        ))
+
+    def _raw_continuation_entry(self, raw: dict, *, score: float, rank: int, stable_id: str) -> dict:
+        family = self._canonical_content_family(raw.get("content_family") or raw.get("format") or "conversation")
+        entry_type = "document_raw" if family == "document" else "conversation_raw"
+        return {
+            "entry_version": 1,
+            "type": entry_type,
+            "family": "document" if entry_type == "document_raw" else "conversation",
+            "source_id": raw.get("source_id") or raw.get("session_id"),
+            "episode_id": raw.get("episode_id"),
+            "message_id": raw.get("message_id"),
+            "rank": rank,
+            "score": float(score),
+            "stable_id": stable_id,
+            "session_id": raw.get("session_id") or raw.get("session_key"),
+            "session_num": raw.get("session_num"),
+            "timestamp_ms": raw.get("timestamp_ms"),
+            "role": raw.get("role"),
+            "raw_evidence_kind": raw.get("raw_evidence_kind"),
+            "status": raw.get("status"),
+        }
+
+    def _resolve_raw_continuation_entry(self, entry: dict) -> dict | None:
+        message_id = str(entry.get("message_id") or "").strip()
+        episode_id = str(entry.get("episode_id") or "").strip()
+        if message_id:
+            for raw_session in self._raw_sessions:
+                if not isinstance(raw_session, dict):
+                    continue
+                raw_entry = self._raw_entry_from_session(raw_session)
+                if str(raw_entry.get("message_id") or "").strip() == message_id:
+                    raw_entry["raw_evidence_kind"] = entry.get("raw_evidence_kind") or "completed_legacy_raw_session"
+                    raw_entry["score"] = float(entry.get("score") or 0.0)
+                    return raw_entry
+        if episode_id:
+            for doc in self._episode_corpus.get("documents", []):
+                for episode in doc.get("episodes", []):
+                    if not isinstance(episode, dict):
+                        continue
+                    if str(episode.get("episode_id") or "").strip() != episode_id:
+                        continue
+                    item = self._raw_recall_item_from_episode(
+                        episode,
+                        score=float(entry.get("score") or 0.0),
+                        evidence_kind=str(entry.get("raw_evidence_kind") or "completed_raw_episode"),
+                    )
+                    return item
+        return None
+
+    def _fact_continuation_entry(self, fact: dict, *, score: float, rank: int, stable_id: str) -> dict:
+        family = self._fact_source_family(fact) or "conversation"
+        entry_type = "document_raw" if family == "document" else "conversation_raw"
+        return {
+            "entry_version": 1,
+            "type": entry_type,
+            "family": "document" if entry_type == "document_raw" else "conversation",
+            "source_id": fact.get("source_id") or (fact.get("metadata") or {}).get("episode_source_id"),
+            "episode_id": next(iter(fact_episode_ids(fact)), None),
+            "fact_id": fact.get("id"),
+            "rank": rank,
+            "score": float(score),
+            "stable_id": stable_id,
+            "fact": str(fact.get("fact") or ""),
+            "session": fact.get("session"),
+        }
+
+    def _codebase_render_ref_id_for_fact(self, fact: dict) -> str:
+        direct = str(
+            fact.get("render_ref_id")
+            or (fact.get("metadata") or {}).get("render_ref_id")
+            or ""
+        ).strip()
+        if direct:
+            return direct
+        fact_id = str(fact.get("id") or "").strip()
+        if not fact_id:
+            return ""
+        graph = normalize_container_graph(getattr(self, "_container_graph", None))
+        for container in graph.get("containers", []):
+            if str(container.get("container_id") or "") != fact_id:
                 continue
-            fact = dict(item.get("item") or {})
-            text = str(fact.get("fact") or "").strip()
-            if not text:
-                continue
-            session = fact.get("session")
-            prefix = f"(S{session}) " if session else ""
-            fact_lines.append(f"- {prefix}{text}")
+            return str(container.get("primary_render_ref_id") or "").strip()
+        return ""
+
+    def _codebase_render_ref_by_id(self, render_ref_id: str) -> dict | None:
+        wanted = str(render_ref_id or "").strip()
+        if not wanted:
+            return None
+        graph = normalize_container_graph(getattr(self, "_container_graph", None))
+        for render_ref in graph.get("render_refs", []):
+            if str(render_ref.get("render_ref_id") or "") == wanted and str(render_ref.get("status") or "active") == "active":
+                return deepcopy(render_ref)
+        return None
+
+    @staticmethod
+    def _codebase_fact_line_span(fact: dict) -> dict[str, int | None] | None:
+        span = fact.get("span") or (fact.get("metadata") or {}).get("span")
+        if not isinstance(span, dict):
+            sidecar = fact.get("sidecar_ref")
+            if isinstance(sidecar, dict):
+                span = sidecar.get("span")
+        if not isinstance(span, dict):
+            return None
+        start_line = span.get("start_line")
+        end_line = span.get("end_line")
+        if not isinstance(start_line, int) or not isinstance(end_line, int):
+            return None
+        return {
+            "start_line": start_line,
+            "end_line": end_line,
+            "start_col": span.get("start_col") if isinstance(span.get("start_col"), int) else None,
+            "end_col": span.get("end_col") if isinstance(span.get("end_col"), int) else None,
+        }
+
+    def _codebase_continuation_entry(self, fact: dict, *, score: float, rank: int, stable_id: str) -> dict:
+        metadata = fact.get("metadata") or {}
+        file_sidecar_ref = fact.get("file_sidecar_ref")
+        sidecar_ref = fact.get("sidecar_ref")
+        line_span = self._codebase_fact_line_span(fact)
+        render_ref_id = self._codebase_render_ref_id_for_fact(fact)
+        file_path = str(fact.get("file_path") or metadata.get("file_path") or "").strip()
+        if not file_path and isinstance(file_sidecar_ref, dict):
+            file_path = str(file_sidecar_ref.get("file_path") or "").strip()
+        if not file_path and isinstance(sidecar_ref, dict):
+            file_path = str(sidecar_ref.get("file_path") or "").strip()
+        has_source_ref = bool(line_span and (isinstance(file_sidecar_ref, dict) or render_ref_id))
+        return {
+            "entry_version": 1,
+            "type": "codebase_source" if has_source_ref else "codebase_fact",
+            "family": "codebase",
+            "source_id": fact.get("source_id") or metadata.get("episode_source_id"),
+            "fact_id": fact.get("id"),
+            "rank": rank,
+            "score": float(score),
+            "stable_id": stable_id,
+            "fact": str(fact.get("fact") or ""),
+            "file_path": file_path,
+            "language": str(fact.get("language") or metadata.get("language") or "code").lower(),
+            "line_span": deepcopy(line_span),
+            "semantic_kind": fact.get("semantic_kind") or metadata.get("semantic_kind"),
+            "semantic_type": fact.get("semantic_type") or metadata.get("semantic_type"),
+            "file_sidecar_ref": deepcopy(file_sidecar_ref) if isinstance(file_sidecar_ref, dict) else None,
+            "sidecar_ref": deepcopy(sidecar_ref) if isinstance(sidecar_ref, dict) else None,
+            "render_ref_id": render_ref_id or None,
+            "source_ref_missing_reason": None if has_source_ref else "no_codebase_sidecar_ref",
+        }
+
+    def _continuation_entry_for_candidate(self, item: dict, *, rank: int) -> dict | None:
+        if isinstance(item.get("typed_entry"), dict):
+            return deepcopy(item["typed_entry"])
+        score = float(item.get("score") or 0.0)
+        stable_id = str(item.get("stable_id") or "").strip()
+        if item.get("candidate_kind") == "raw":
+            raw = dict(item.get("item") or {})
+            if not raw:
+                return None
+            return self._raw_continuation_entry(raw, score=score, rank=rank, stable_id=stable_id)
+        fact = dict(item.get("item") or {})
+        if not fact:
+            return None
+        if self._fact_source_family(fact) == "codebase":
+            return self._codebase_continuation_entry(fact, score=score, rank=rank, stable_id=stable_id)
+        return self._fact_continuation_entry(fact, score=score, rank=rank, stable_id=stable_id)
+
+    @staticmethod
+    def _continuation_span_label(span: dict | None) -> str:
+        if not isinstance(span, dict):
+            return "unknown"
+        start_line = span.get("start_line")
+        end_line = span.get("end_line")
+        if start_line is None or end_line is None:
+            return "unknown"
+        if start_line == end_line:
+            return f"L{start_line}"
+        return f"L{start_line}-L{end_line}"
+
+    def _render_codebase_fact_continuation_entry(self, entry: dict, *, reason: str | None = None) -> str:
+        fact_text = str(entry.get("fact") or "").strip() or "(codebase fact text unavailable)"
+        refs: list[str] = []
+        if entry.get("file_path"):
+            refs.append(f"file={entry.get('file_path')}")
+        if entry.get("line_span"):
+            refs.append(f"lines={self._continuation_span_label(entry.get('line_span'))}")
+        if entry.get("render_ref_id"):
+            refs.append(f"render_ref_id={entry.get('render_ref_id')}")
+        sidecar = entry.get("file_sidecar_ref")
+        if isinstance(sidecar, dict) and sidecar.get("sidecar_id"):
+            refs.append(f"file_sidecar_id={sidecar.get('sidecar_id')}")
+        if reason:
+            refs.append(f"source_window_reason={reason}")
+        ref_text = f"\n  refs: {', '.join(refs)}" if refs else ""
+        return f"- {fact_text}{ref_text}"
+
+    @staticmethod
+    def _format_continuation_source_lines(lines: list[str], *, start_line: int) -> str:
+        return "\n".join(f"{idx:>4}: {line}" for idx, line in enumerate(lines, start=start_line))
+
+    def _render_codebase_source_continuation_entry(self, entry: dict) -> tuple[str, dict]:
+        trace: dict[str, Any] = {
+            "entry_type": "codebase_source",
+            "fact_id": entry.get("fact_id"),
+            "file_path": entry.get("file_path"),
+            "rendered": False,
+        }
+        span = entry.get("line_span") if isinstance(entry.get("line_span"), dict) else None
+        if not span:
+            trace["reason"] = "source_window_unavailable"
+            trace["detail"] = "missing_line_span"
+            return self._render_codebase_fact_continuation_entry(entry, reason="source_window_unavailable"), trace
+
+        code = ""
+        file_path = str(entry.get("file_path") or "").strip()
+        language = str(entry.get("language") or "code").strip() or "code"
+        base_line = 1
+        file_sidecar_ref = entry.get("file_sidecar_ref")
+        if isinstance(file_sidecar_ref, dict):
+            try:
+                payload = CodebaseSemanticSidecarStore(str(self.data_dir)).hydrate_sidecar(file_sidecar_ref)
+            except Exception as exc:
+                trace["reason"] = "source_window_unavailable"
+                trace["detail"] = exc.__class__.__name__
+                return self._render_codebase_fact_continuation_entry(entry, reason="source_window_unavailable"), trace
+            code = str(payload.get("code") or "")
+            file_path = str(payload.get("file_path") or file_path or file_sidecar_ref.get("file_path") or "").strip()
+            language = str(payload.get("language") or language or "code").strip() or "code"
+        elif entry.get("render_ref_id"):
+            render_ref = self._codebase_render_ref_by_id(str(entry.get("render_ref_id") or ""))
+            render_json = dict((render_ref or {}).get("ref_json") or {})
+            code = str(render_json.get("text") or "")
+            file_path = str(render_json.get("path") or file_path).strip()
+            language = str((render_ref or {}).get("language") or language or "code").strip() or "code"
+            ref_span = render_json.get("span")
+            if isinstance(ref_span, dict) and isinstance(ref_span.get("start_line"), int):
+                base_line = int(ref_span.get("start_line") or 1)
+        if not code.strip():
+            trace["reason"] = "source_window_unavailable"
+            trace["detail"] = "empty_source_payload"
+            return self._render_codebase_fact_continuation_entry(entry, reason="source_window_unavailable"), trace
+
+        lines = code.splitlines() or [""]
+        line_count = len(lines)
+        span_start = int(span.get("start_line") or base_line)
+        span_end = int(span.get("end_line") or span_start)
+        radius = 18
+        local_start = max(1, span_start - base_line + 1 - radius)
+        local_end = min(line_count, span_end - base_line + 1 + radius)
+        if local_end < local_start:
+            local_start = 1
+            local_end = min(line_count, 80)
+        window_start_line = base_line + local_start - 1
+        window_end_line = base_line + local_end - 1
+        window_lines = lines[local_start - 1:local_end]
+        fact_id = str(entry.get("fact_id") or "")
+        header = (
+            f"[File: {file_path or 'unknown'}] [Language: {language}] [Mode: source_window] "
+            f"[Lines: L{window_start_line}-L{window_end_line}] [Fact: {fact_id or 'unknown'}]"
+        )
+        text = (
+            f"{header}\n"
+            f"```{language}\n"
+            f"{self._format_continuation_source_lines(window_lines, start_line=window_start_line)}\n"
+            "```"
+        )
+        trace.update({
+            "rendered": True,
+            "mode": "source_window",
+            "line_span": {"start_line": window_start_line, "end_line": window_end_line},
+            "source_line_count": line_count,
+        })
+        return text, trace
+
+    def _render_typed_recall_continuation_page(
+        self,
+        entries: list[dict],
+        *,
+        page_num: int,
+        hydrate_codebase_source: bool,
+    ) -> tuple[str, dict[str, Any]]:
         sections = [f"RECALL CONTINUATION PAGE {page_num}:"]
+        fact_lines: list[str] = []
+        raw_by_type: dict[str, list[dict]] = {"conversation_raw": [], "document_raw": []}
+        code_source_blocks: list[str] = []
+        code_fact_lines: list[str] = []
+        render_failures: list[dict[str, Any]] = []
+
+        for entry in entries:
+            entry_type = str(entry.get("type") or "")
+            if entry_type in raw_by_type:
+                raw = self._resolve_raw_continuation_entry(entry) or {}
+                if raw:
+                    raw_by_type[entry_type].append(raw)
+                elif entry.get("fact"):
+                    session = entry.get("session")
+                    prefix = f"(S{session}) " if session else ""
+                    fact_lines.append(f"- {prefix}{entry.get('fact')}")
+                continue
+            if entry_type == "codebase_source":
+                if hydrate_codebase_source:
+                    rendered, render_trace = self._render_codebase_source_continuation_entry(entry)
+                    if render_trace.get("rendered"):
+                        code_source_blocks.append(rendered)
+                    else:
+                        code_fact_lines.append(rendered)
+                        render_failures.append(render_trace)
+                else:
+                    code_fact_lines.append(
+                        self._render_codebase_fact_continuation_entry(entry, reason="source_window_deferred")
+                    )
+                continue
+            if entry_type == "codebase_fact":
+                code_fact_lines.append(
+                    self._render_codebase_fact_continuation_entry(
+                        entry,
+                        reason=entry.get("source_ref_missing_reason"),
+                    )
+                )
+                continue
+            if entry.get("fact"):
+                fact_lines.append(f"- {entry.get('fact')}")
+
         if fact_lines:
             sections.append("RETRIEVED FACTS:\n" + "\n".join(fact_lines))
-        raw_context = self._render_raw_recall_context(raw_items)
-        if raw_context:
-            sections.append(raw_context)
+        for entry_type in ("conversation_raw", "document_raw"):
+            raw_context = self._render_raw_recall_context(raw_by_type[entry_type])
+            if raw_context:
+                sections.append(raw_context)
+        if code_source_blocks:
+            sections.append("CODEBASE SOURCE WINDOWS:\n" + "\n\n".join(code_source_blocks))
+        if code_fact_lines:
+            sections.append("CODEBASE FACTS:\n" + "\n".join(code_fact_lines))
+
         rendered = "\n\n".join(sections).strip()
         if len(rendered) > 6000:
             rendered = rendered[:6000] + "\n[...truncated]"
+        trace = {
+            "handle_version": 2,
+            "page": page_num,
+            "entries_rendered": len(entries),
+            "typed_entry_counts": self._typed_continuation_entry_counts(entries),
+            "source_hydration": {
+                "hydrated": bool(hydrate_codebase_source and code_source_blocks),
+                "reason": "continuation_page" if hydrate_codebase_source and code_source_blocks else (
+                    "source_window_deferred" if not hydrate_codebase_source else "no_codebase_source_rendered"
+                ),
+            },
+            "render_failures": render_failures,
+        }
+        return rendered, trace
+
+    def _render_recall_continuation_page(self, items: list[dict], *, page_num: int) -> str:
+        entries = [
+            entry
+            for rank, item in enumerate(items)
+            if (entry := self._continuation_entry_for_candidate(item, rank=rank)) is not None
+        ]
+        rendered, _trace = self._render_typed_recall_continuation_page(
+            entries,
+            page_num=page_num,
+            hydrate_codebase_source=False,
+        )
         return rendered
 
     def _recall_continuation_now_ms(self) -> int:
@@ -11916,6 +12748,9 @@ class MemoryServer:
         self._prune_recall_continuations(now_ms)
         self._recall_continuations[handle] = {
             "pages": deepcopy(pages),
+            "handle_version": int(continuation.get("handle_version") or 1),
+            "typed_entries": deepcopy(result.get("_recall_continuation_typed_entries") or []),
+            "swarm_id": str(swarm_id or ""),
             "acl_key": self._recall_continuation_acl_key(
                 caller_id=caller_id,
                 caller_memberships=caller_memberships,
@@ -11927,6 +12762,8 @@ class MemoryServer:
             "candidate_count": int(continuation.get("candidate_count") or 0),
             "returned_count": int(continuation.get("returned_count") or 0),
             "anchor_terms": list(continuation.get("anchor_terms") or []),
+            "typed_entry_counts": dict(continuation.get("typed_entry_counts") or {}),
+            "families_with_continuation": list(continuation.get("families_with_continuation") or []),
             "expires_at_ms": now_ms + self._recall_continuation_ttl_ms(),
         }
 
@@ -11939,18 +12776,13 @@ class MemoryServer:
         caller_memberships: list | None,
         caller_role: str,
         swarm_id: str | None,
+        bind_swarm_from_handle: bool = False,
     ) -> dict:
         handle = str(continuation_handle or "").strip()
         now_ms = self._recall_continuation_now_ms()
         self._prune_recall_continuations(now_ms)
         state = self._recall_continuations.get(handle)
-        acl_key = self._recall_continuation_acl_key(
-            caller_id=caller_id,
-            caller_memberships=caller_memberships,
-            caller_role=caller_role,
-            swarm_id=swarm_id,
-        )
-        if not state or state.get("acl_key") != acl_key:
+        if not state:
             return {
                 "error": "Recall continuation not found",
                 "code": "RECALL_CONTINUATION_NOT_FOUND",
@@ -11958,6 +12790,45 @@ class MemoryServer:
                     "available": False,
                     "handle": handle,
                     "exhausted": True,
+                },
+            }
+        effective_swarm_id = swarm_id
+        used_handle_swarm_binding = False
+        if bind_swarm_from_handle and str(swarm_id or "").strip() in {"", "default"}:
+            stored_swarm_id = str(state.get("swarm_id") or "").strip()
+            if not stored_swarm_id:
+                stored_acl_key = state.get("acl_key")
+                if isinstance(stored_acl_key, tuple) and len(stored_acl_key) >= 4:
+                    stored_swarm_id = str(stored_acl_key[3] or "").strip()
+            if stored_swarm_id:
+                effective_swarm_id = stored_swarm_id
+                used_handle_swarm_binding = True
+        acl_key = self._recall_continuation_acl_key(
+            caller_id=caller_id,
+            caller_memberships=caller_memberships,
+            caller_role=caller_role,
+            swarm_id=effective_swarm_id,
+        )
+        if state.get("acl_key") != acl_key:
+            return {
+                "error": "Recall continuation not found",
+                "code": "RECALL_CONTINUATION_NOT_FOUND",
+                "recall_continuation": {
+                    "available": False,
+                    "handle": handle,
+                    "exhausted": True,
+                },
+                "runtime_trace": {
+                    "recall_continuation_trace": {
+                        "handle_version": int(state.get("handle_version") or 1),
+                        "page_requested": page,
+                        "entries_rendered": 0,
+                        "next_index": None,
+                        "has_more": False,
+                        "render_failures": [],
+                        "acl_mismatch": True,
+                        "handle_bound_swarm_id": used_handle_swarm_binding,
+                    }
                 },
             }
         if (isinstance(page, str) and page.strip().lower() == "next") or page in (None, ""):
@@ -11992,12 +12863,37 @@ class MemoryServer:
                     "recall_continuation": {
                         "page": page_num,
                         "exhausted": True,
-                        "public_mcp_tool": "memory_recall",
+                        "public_mcp_tool": "get_more_context",
+                    },
+                    "recall_continuation_trace": {
+                        "handle_version": int(state.get("handle_version") or 1),
+                        "page_requested": page,
+                        "entries_rendered": 0,
+                        "next_index": None,
+                        "has_more": False,
+                        "render_failures": [],
+                        "handle_bound_swarm_id": used_handle_swarm_binding,
                     }
                 },
             }
         next_page = selected.get("next_page")
         exhausted = bool(selected.get("exhausted"))
+        selected_entries = list(selected.get("typed_entries") or [])
+        if selected_entries:
+            context, render_trace = self._render_typed_recall_continuation_page(
+                selected_entries,
+                page_num=page_num,
+                hydrate_codebase_source=True,
+            )
+        else:
+            context = str(selected.get("context") or "")
+            render_trace = {
+                "handle_version": int(state.get("handle_version") or 1),
+                "page": page_num,
+                "entries_rendered": int(selected.get("returned_count") or 0),
+                "typed_entry_counts": {},
+                "render_failures": [],
+            }
         if next_page:
             state["next_page"] = int(next_page)
             state["expires_at_ms"] = now_ms + self._recall_continuation_ttl_ms()
@@ -12005,12 +12901,13 @@ class MemoryServer:
             exhausted = True
             self._recall_continuations.pop(handle, None)
         return {
-            "context": str(selected.get("context") or ""),
+            "context": context,
             "retrieved": [],
             "query_type": "continuation",
             "recall_continuation": {
                 "available": not exhausted,
                 "handle": handle,
+                "handle_version": int(state.get("handle_version") or 1),
                 "page": page_num,
                 "next_page": next_page,
                 "page_size": state.get("page_size", 0),
@@ -12018,13 +12915,22 @@ class MemoryServer:
                 "returned_count": state.get("returned_count", 0),
                 "exhausted": exhausted,
                 "anchor_terms": list(state.get("anchor_terms") or []),
+                "typed_entry_counts": dict(state.get("typed_entry_counts") or {}),
+                "families_with_continuation": list(state.get("families_with_continuation") or []),
             },
             "runtime_trace": {
                 "recall_continuation": {
                     "page": page_num,
                     "exhausted": exhausted,
-                    "public_mcp_tool": "memory_recall",
-                }
+                    "public_mcp_tool": "get_more_context",
+                },
+                "recall_continuation_trace": {
+                    **render_trace,
+                    "page_requested": page,
+                    "next_index": page_num + 1 if next_page else None,
+                    "has_more": not exhausted,
+                    "handle_bound_swarm_id": used_handle_swarm_binding,
+                },
             },
         }
 
@@ -12040,22 +12946,62 @@ class MemoryServer:
         swarm_id: str | None,
         raw_kind: str,
     ) -> dict:
+        def _record_trace(
+            *,
+            handle_created: bool,
+            typed_entries: list[dict] | None = None,
+            skipped_reasons: list[str] | None = None,
+            page_count: int = 0,
+        ) -> None:
+            entries = list(typed_entries or [])
+            runtime_trace = dict(result.get("runtime_trace") or {})
+            entry_skips = [
+                str(entry.get("source_ref_missing_reason") or "")
+                for entry in entries
+                if str(entry.get("source_ref_missing_reason") or "")
+            ]
+            trace = {
+                "handle_created": handle_created,
+                "handle_version": 2,
+                "families_with_continuation": self._typed_continuation_families(entries),
+                "typed_entry_counts": self._typed_continuation_entry_counts(entries),
+                "first_page_entry_count": len(result.get("retrieved") or []),
+                "has_more": handle_created,
+                "page_count": page_count,
+                "skipped_reasons": list(dict.fromkeys([*list(skipped_reasons or []), *entry_skips])),
+            }
+            runtime_trace["recall_continuation_trace"] = trace
+            if handle_created:
+                runtime_trace["recall_continuation"] = {
+                    "available": True,
+                    "candidate_count": len(entries),
+                    "page_count": page_count,
+                    "anchor_terms": self._recall_continuation_anchor_terms(query),
+                }
+            result["runtime_trace"] = runtime_trace
+
         if raw_kind != "all":
+            _record_trace(handle_created=False, skipped_reasons=["raw_kind_not_all"])
             return result
-        families = self._raw_families_for_result(
+        raw_families = self._raw_families_for_result(
             result.get("search_family"),
             result.get("retrieval_families"),
         )
-        if not families or families == {"codebase"}:
-            return result
         anchor_terms = self._recall_continuation_anchor_terms(query)
         if not anchor_terms:
+            _record_trace(handle_created=False, skipped_reasons=["no_anchor_terms"])
             return result
         retrieved_items = list(result.get("retrieved") or [])
+        visible_lookup = self._visible_fact_lookup(fact_filter, search_family="auto")
+        visible_code_lookup = {
+            fact_id: fact
+            for fact_id, fact in visible_lookup.items()
+            if self._fact_source_family(fact) == "codebase"
+        }
         seen_fact_ids = {
-            str(item.get("id") or "").strip()
+            str(item.get("id") or item.get("fact_id") or "").strip()
             for item in retrieved_items
-            if isinstance(item, dict) and str(item.get("id") or "").strip()
+            if isinstance(item, dict) and str(item.get("id") or item.get("fact_id") or "").strip()
         }
         seen_raw_keys = {
             str(item.get("message_id") or item.get("episode_id") or item.get("content") or "").strip()
@@ -12063,6 +13009,34 @@ class MemoryServer:
             if isinstance(item, dict)
         }
         candidates: list[dict] = []
+        codebase_seed_fact_ids: list[str] = []
+        codebase_retrieval_scores: dict[str, float] = {}
+        for rank, item in enumerate(retrieved_items):
+            if not isinstance(item, dict):
+                continue
+            fact_id = str(item.get("id") or item.get("fact_id") or "").strip()
+            if not fact_id or fact_id not in visible_code_lookup:
+                continue
+            if fact_id in codebase_seed_fact_ids:
+                continue
+            codebase_seed_fact_ids.append(fact_id)
+            codebase_retrieval_scores[fact_id] = float(item.get("sim") or item.get("score") or max(0, 10_000 - rank))
+        for rank, fact_id in enumerate(codebase_seed_fact_ids):
+            fact = visible_code_lookup[fact_id]
+            candidates.append({
+                "candidate_kind": "codebase",
+                "score": codebase_retrieval_scores.get(fact_id, float(10_000 - rank)),
+                "session_num": 0,
+                "timestamp_ms": 0,
+                "stable_id": fact_id,
+                "item": fact,
+                "typed_entry": self._codebase_continuation_entry(
+                    fact,
+                    score=codebase_retrieval_scores.get(fact_id, float(10_000 - rank)),
+                    rank=rank,
+                    stable_id=fact_id,
+                ),
+            })
         for fact in [*self._all_granular, *self._all_cons, *self._all_cross]:
             if not isinstance(fact, dict):
                 continue
@@ -12071,8 +13045,8 @@ class MemoryServer:
                 continue
             if not fact_filter(fact):
                 continue
-            family = self._fact_source_family(fact) or ("conversation" if "conversation" in families else "")
-            if family == "codebase" or (families and family not in families):
+            family = self._fact_source_family(fact) or ("conversation" if "conversation" in raw_families else "")
+            if family == "codebase" or (raw_families and family not in raw_families):
                 continue
             score = self._score_fact_for_recall_continuation(fact, anchor_terms)
             if score <= 0:
@@ -12087,7 +13061,7 @@ class MemoryServer:
             })
         raw_candidates = self._raw_recall_entries(
             query=query,
-            families=families,
+            families=raw_families,
             caller_id=caller_id,
             caller_memberships=caller_memberships,
             caller_role=caller_role,
@@ -12111,6 +13085,12 @@ class MemoryServer:
                 "item": raw,
             })
         if not candidates:
+            skipped = []
+            if not raw_families:
+                skipped.append("no_raw_family_candidates")
+            if not codebase_seed_fact_ids:
+                skipped.append("no_codebase_source_refs")
+            _record_trace(handle_created=False, skipped_reasons=skipped or ["no_continuation_candidates"])
             return result
         candidates.sort(
             key=lambda item: (
@@ -12122,38 +13102,52 @@ class MemoryServer:
         )
         page_size = 5
         max_pages = 6
+        typed_entries = [
+            entry
+            for rank, item in enumerate(candidates)
+            if (entry := self._continuation_entry_for_candidate(item, rank=rank)) is not None
+        ]
+        if not typed_entries:
+            _record_trace(handle_created=False, skipped_reasons=["no_typed_entries"])
+            return result
         pages: list[dict] = []
         for page_index in range(max_pages):
             start = page_index * page_size
-            chunk = candidates[start:start + page_size]
+            chunk = typed_entries[start:start + page_size]
             if not chunk:
                 break
             page_num = page_index + 2
             next_start = start + page_size
             pages.append({
                 "page": page_num,
-                "next_page": page_num + 1 if next_start < len(candidates) and page_index + 1 < max_pages else None,
-                "exhausted": not (next_start < len(candidates) and page_index + 1 < max_pages),
-                "context": self._render_recall_continuation_page(chunk, page_num=page_num),
+                "next_page": page_num + 1 if next_start < len(typed_entries) and page_index + 1 < max_pages else None,
+                "exhausted": not (next_start < len(typed_entries) and page_index + 1 < max_pages),
+                "typed_entries": deepcopy(chunk),
+                "typed_entry_counts": self._typed_continuation_entry_counts(chunk),
                 "returned_count": len(chunk),
             })
         if not pages:
+            _record_trace(handle_created=False, typed_entries=typed_entries, skipped_reasons=["no_pages"])
             return result
         handle = secrets.token_urlsafe(24)
         while handle in self._recall_continuations:
             handle = secrets.token_urlsafe(24)
         result["_recall_continuation_pages"] = pages
+        result["_recall_continuation_typed_entries"] = typed_entries
         result["recall_continuation"] = {
             "available": True,
             "handle": handle,
+            "handle_version": 2,
             "next_page": 2,
             "page_size": page_size,
-            "candidate_count": len(candidates),
+            "candidate_count": len(typed_entries),
             "returned_count": len(retrieved_items),
             "exhausted": False,
             "anchor_terms": anchor_terms,
+            "typed_entry_counts": self._typed_continuation_entry_counts(typed_entries),
+            "families_with_continuation": self._typed_continuation_families(typed_entries),
             "tool": "get_more_context",
-            "tool_usage": "call get_more_context with page=\"next\" or without session_id to fetch the next evidence page",
+            "tool_usage": "call get_more_context with handle=<handle> and page=\"next\" to fetch the next evidence page",
         }
         continuation_note = self._recall_continuation_context_note(result.get("recall_continuation"))
         context = str(result.get("context") or "").strip()
@@ -12163,14 +13157,7 @@ class MemoryServer:
             sections=[("recall_continuation", continuation_note)],
         )
         result["context"] = f"{context}\n\n{continuation_note}" if context else continuation_note
-        runtime_trace = dict(result.get("runtime_trace") or {})
-        runtime_trace["recall_continuation"] = {
-            "available": True,
-            "candidate_count": len(candidates),
-            "page_count": len(pages),
-            "anchor_terms": anchor_terms,
-        }
-        result["runtime_trace"] = runtime_trace
+        _record_trace(handle_created=True, typed_entries=typed_entries, page_count=len(pages))
         self._remember_recall_continuation(
             result,
             caller_id=caller_id,
@@ -17134,6 +18121,7 @@ class MemoryServer:
                 )
             merged_retrieval_families = list(packet.get("retrieval_families", []))
             mixed_merge_trace: dict[str, Any] | None = None
+            generic_codebase_discovery_trace: dict[str, Any] | None = None
             if auto_mixed_code_query:
                 (
                     mixed_context,
@@ -17160,6 +18148,42 @@ class MemoryServer:
                         if family
                     )
                 )
+            elif search_family in {"auto", "", None} and has_visible_codebase_facts and code_query_mode == "non_code":
+                (
+                    discovered_code_facts,
+                    discovered_code_context,
+                    generic_codebase_discovery_trace,
+                ) = await self._auto_discover_codebase_evidence(
+                    query=retrieval_query,
+                    query_type=query_type,
+                    query_metadata=repo_task_metadata,
+                    fact_filter=fact_filter,
+                    episode_facts=resolved_facts,
+                    code_query_mode=code_query_mode,
+                )
+                if discovered_code_facts:
+                    resolved_facts = list(resolved_facts)
+                    seen_fact_ids = {
+                        str(fact.get("id") or "").strip()
+                        for fact in resolved_facts
+                        if str(fact.get("id") or "").strip()
+                    }
+                    for fact in discovered_code_facts:
+                        fact_id = str(fact.get("id") or "").strip()
+                        if fact_id and fact_id in seen_fact_ids:
+                            continue
+                        resolved_facts.append(fact)
+                        if fact_id:
+                            seen_fact_ids.add(fact_id)
+                    packet = dict(packet)
+                    if discovered_code_context:
+                        packet["context"] = f"{packet['context'].rstrip()}\n\n{discovered_code_context}"
+                    packet["retrieved_fact_ids"] = [
+                        str(fact.get("id") or "")
+                        for fact in resolved_facts
+                        if str(fact.get("id") or "")
+                    ]
+                    merged_retrieval_families = list(dict.fromkeys([*merged_retrieval_families, "codebase"]))
             code_segments, code_trace = augment_codebase_context(
                 query=query,
                 retrieved_facts=resolved_facts,
@@ -17248,6 +18272,17 @@ class MemoryServer:
                 result["repo_task_context_packs"] = repo_task_context_packs
             result["runtime_trace"].setdefault("query", {})
             result["runtime_trace"]["query"]["code_query_mode"] = code_query_mode
+            result["runtime_trace"]["family_discovery"] = self._family_discovery_trace(
+                fact_filter=fact_filter,
+                requested_search_family=search_family,
+                searched_families=merged_retrieval_families,
+                selected_facts=resolved_facts,
+                code_query_mode=code_query_mode,
+                merged_families=merged_retrieval_families,
+                codebase_probe_trace=generic_codebase_discovery_trace,
+                codebase_augmentation_trace=code_trace,
+                episode_first_pass_trace=packet.get("family_first_pass_trace"),
+            )
             if mixed_merge_trace is not None:
                 result["runtime_trace"]["mixed_family_merge"] = mixed_merge_trace
             deterministic_answer: str | None = None
@@ -17378,6 +18413,15 @@ class MemoryServer:
                     "runtime": "episode",
                     "scope": self._scope_trace(),
                     "reason": "empty_visible_facts",
+                    "family_discovery": self._family_discovery_trace(
+                        fact_filter=fact_filter,
+                        requested_search_family=search_family,
+                        searched_families=[],
+                        selected_facts=[],
+                        code_query_mode=code_query_mode,
+                        merged_families=[],
+                        codebase_augmentation_trace={"mode": "inactive", "reason": "empty_visible_facts"},
+                    ),
                     "family_first_pass": {
                         "available_families": available_families(self._episode_corpus),
                         "retrieval_families": [],
@@ -17415,14 +18459,48 @@ class MemoryServer:
                     "tuning": get_runtime_tuning(),
                 },
             })
-        return _with_raw_recall(await self._generic_fact_recall(
+        generic_result = await self._generic_fact_recall(
             query=retrieval_query,
             fact_filter=fact_filter,
             search_family=effective_search_family,
             query_type=query_type,
             query_metadata=repo_task_metadata,
             path_constraint_query=query,
-        ))
+        )
+        generic_runtime_trace = dict(generic_result.get("runtime_trace") or {})
+        lookup = self._visible_fact_lookup(fact_filter, search_family="auto")
+        generic_selected_facts: list[dict[str, Any]] = []
+        seen_generic_fact_ids: set[str] = set()
+        for item in generic_result.get("retrieved", []) or []:
+            if not isinstance(item, dict):
+                continue
+            generic_fact: dict[str, Any] | None
+            if item.get("fact") is not None and item.get("id") is not None:
+                fact_id = str(item.get("id") or "").strip()
+                generic_fact = cast(dict[str, Any], item)
+            else:
+                fact_id = str(item.get("fact_id") or "").strip()
+                generic_fact = lookup.get(fact_id)
+            if not fact_id or fact_id in seen_generic_fact_ids or generic_fact is None:
+                continue
+            seen_generic_fact_ids.add(fact_id)
+            generic_selected_facts.append(generic_fact)
+        generic_searched_families = (
+            self._visible_source_families(fact_filter)
+            if effective_search_family in {"auto", "", None}
+            else [str(effective_search_family or "").strip().lower()]
+        )
+        generic_runtime_trace["family_discovery"] = self._family_discovery_trace(
+            fact_filter=fact_filter,
+            requested_search_family=search_family,
+            searched_families=generic_searched_families,
+            selected_facts=generic_selected_facts,
+            code_query_mode=code_query_mode,
+            merged_families=list(generic_result.get("retrieval_families") or []),
+            codebase_augmentation_trace=generic_runtime_trace.get("codebase_augmentation"),
+        )
+        generic_result["runtime_trace"] = generic_runtime_trace
+        return _with_raw_recall(generic_result)
 
     # ── context_for() ──
 
@@ -18300,11 +19378,12 @@ class MemoryServer:
             anchor_text = f"More evidence matches anchors {anchor_terms}. "
         else:
             anchor_text = "More evidence matches this recall query. "
+        handle = str(continuation.get("handle") or "<handle>")
         return (
             "RECALL CONTINUATION AVAILABLE:\n"
             f"{anchor_text}"
-            "If the answer is not in this page, call get_more_context with page=\"next\" "
-            "or without session_id to retrieve the next evidence page."
+            "If the answer is not in this page, call get_more_context with "
+            f"handle=\"{handle}\" and page=\"next\" to retrieve the next evidence page."
         )
 
     def _context_packet_with_recall_continuation(self, context_packet: dict, recall_result: dict) -> dict:
@@ -18438,7 +19517,8 @@ class MemoryServer:
                 "instruction": (
                     "The returned context is the first evidence page. "
                     "If the answer is not present and more evidence is available, "
-                    "call get_more_context with page=\"next\" or no session_id to fetch the next page."
+                    "call get_more_context with handle=<recall_continuation.handle> "
+                    "and page=\"next\" to fetch the next page."
                 ),
             }
         return contract
@@ -19430,10 +20510,29 @@ class MemoryServer:
                 "confirmed in",
             )
         )
-        if not best_grounded and meta_explanation and not any(
-            _candidate_adds_new_slot_info(candidate)
-            for candidate in answer_surface_candidates
+        if (
+            not best_grounded
+            and meta_explanation
+            and negative_answer
+            and not any(
+                _candidate_adds_new_slot_info(candidate)
+                for candidate in answer_surface_candidates
+            )
         ):
+            # ``meta_explanation`` (presence of words like ``retrieved fact``
+            # or ``explicitly stated``) is not, on its own, a hallucination
+            # signal — a correct positive answer that cites its evidence
+            # legitimately uses such wording. The earlier rule fired on
+            # any positive answer with citation language, producing a
+            # large class of false-positive ``Not mentioned`` outputs.
+            #
+            # Tighten the rule by also requiring ``negative_answer``: only
+            # return NM when the answer text itself signals "not mentioned"
+            # / "unknown" / etc. AND no grounded candidate could be
+            # surfaced from the recall context. Positive answers with
+            # evidence citations now fall through to the token-grounding
+            # gate (which judges the answer core, see
+            # ``_answer_core_for_grounding`` below).
             if country_support_candidate:
                 return country_support_candidate
             if commonality_interest_answer:
@@ -19500,9 +20599,34 @@ class MemoryServer:
             if support_candidate:
                 return support_candidate
 
+        # Token grounding gate.
+        #
+        # The gate must judge the *answer core* (what the model actually
+        # claims), not its citation/explanation tail. Instruction-tuned
+        # models routinely append "(Evidence: [1][2] explicitly state...)"
+        # or "Sources: [1] (S3) explicitly states ..." after a correct
+        # answer. Tokenising those tails inflates ``answer_tokens`` with
+        # words that never appear in raw evidence (`evidence`, `sources`,
+        # `explicitly`, `state`, bracket refs), which the strict
+        # ``all(token in grounding_text)`` rule then treats as
+        # ungrounded → false positive ``Not mentioned``.
+        #
+        # ``_answer_core_for_grounding`` strips those wrappers so the gate
+        # sees just the substantive claim. The ``all()`` membership rule
+        # is preserved on the core: a real hallucination (zero core
+        # tokens in evidence) still triggers the NM path, but a correct
+        # answer with citations no longer does.
+        #
+        # Date-component tokens (month names, weekday names) are also
+        # stripped because the answer surface "21 May 2023" would
+        # tokenise to ``may`` while the grounding evidence may carry the
+        # numeric form ``2023-05-21`` — a lexical mismatch that does not
+        # indicate hallucination. Numeric tokens (``21``, ``2023``) are
+        # already excluded by the ``[A-Za-z]+`` regex.
+        answer_core = _answer_core_for_grounding(answer)
         answer_tokens = {
             normalize_term_token(token)
-            for token in re.findall(r"[A-Za-z]+(?:-[A-Za-z]+)?", answer)
+            for token in re.findall(r"[A-Za-z]+(?:-[A-Za-z]+)?", answer_core)
             if normalize_term_token(token)
         }
         answer_tokens -= {
@@ -19511,6 +20635,9 @@ class MemoryServer:
             if token in qf.get("words", set()) or token in head_tokens
         }
         answer_tokens -= {"the", "a", "an", "one", "provided", "context", "mentioned"}
+        # Date-component tokens — universal English temporal vocabulary,
+        # not benchmark-specific.
+        answer_tokens -= _GROUNDED_GATE_DATE_COMPONENT_TOKENS
         if not answer_tokens:
             return "Not mentioned in the provided context."
         grounding_text = " ".join(slot_grounding_texts or support_texts).lower()
@@ -20067,6 +21194,79 @@ class MemoryServer:
             + output_tokens / 1000 * pricing["output_per_1k"]
         )
 
+    @staticmethod
+    def _positive_session_id(value: Any) -> int:
+        try:
+            session_id = int(value)
+        except (TypeError, ValueError):
+            return 0
+        return session_id if session_id > 0 else 0
+
+    @staticmethod
+    def _continuation_tool_result_from_page(result: dict) -> dict:
+        continuation = dict(result.get("recall_continuation") or {})
+        context = str(result.get("context") or result.get("error") or "")
+        response = {
+            "result": context,
+            "context": context,
+            "page": continuation.get("page"),
+            "next_page": continuation.get("next_page"),
+            "exhausted": bool(continuation.get("exhausted")),
+            "continuation_handle": continuation.get("handle"),
+            "handle": continuation.get("handle"),
+            "recall_continuation": continuation,
+            "runtime_trace": result.get("runtime_trace", {}),
+        }
+        if result.get("error") or result.get("code"):
+            response["error"] = result.get("error", "Recall continuation failed")
+            response["code"] = result.get("code", "RECALL_CONTINUATION_ERROR")
+        return response
+
+    def _execute_get_more_context_tool(
+        self,
+        input_data: dict,
+        *,
+        continuation_pages: list[dict],
+        continuation_handle: str,
+        continuation_state: dict,
+        continuation_acl: dict,
+        caller_id: str | None,
+    ) -> dict:
+        args = dict(input_data or {})
+        page = args.get("page")
+        provided_handle = str(args.get("handle") or args.get("continuation_handle") or "").strip()
+        default_handle = str(continuation_handle or "").strip()
+        requested_handle = provided_handle or default_handle
+        session_id = self._positive_session_id(args.get("session_id", 0))
+        wants_continuation = bool(requested_handle) and (
+            bool(provided_handle)
+            or page not in (None, "")
+            or session_id == 0
+        )
+        if wants_continuation:
+            result = self.recall_continuation_page(
+                continuation_handle=requested_handle,
+                page=page or "next",
+                caller_id=continuation_acl.get("caller_id") or caller_id,
+                caller_memberships=list(continuation_acl.get("caller_memberships") or []),
+                caller_role=str(continuation_acl.get("caller_role") or "user"),
+                swarm_id=continuation_acl.get("swarm_id"),
+                bind_swarm_from_handle=True,
+            )
+            return self._continuation_tool_result_from_page(result)
+
+        legacy_full_session = session_id > 0 and not provided_handle and page in (None, "")
+        return get_more_context(
+            session_id,
+            raw_sessions=self._raw_sessions,
+            page=page,
+            handle=provided_handle,
+            continuation_handle=args.get("continuation_handle"),
+            recall_continuation_pages=[] if legacy_full_session else continuation_pages,
+            recall_continuation_handle="" if legacy_full_session else default_handle,
+            continuation_state=continuation_state,
+        )
+
     async def _send_payload(
         self,
         payload: dict,
@@ -20076,11 +21276,16 @@ class MemoryServer:
     ) -> tuple[str, bool, list[dict]]:
         continuation_pages = list(payload.get("_recall_continuation_pages") or [])
         continuation_handle = str(payload.get("_recall_continuation_handle") or "")
+        continuation_acl = dict(payload.get("_recall_continuation_acl") or {})
         continuation_state = {"next_page": 2}
         payload = {
             key: value
             for key, value in payload.items()
-            if key not in {"_recall_continuation_pages", "_recall_continuation_handle"}
+            if key not in {
+                "_recall_continuation_pages",
+                "_recall_continuation_handle",
+                "_recall_continuation_acl",
+            }
         }
         model = payload["model"]
         backend = str(payload.get("backend") or "api")
@@ -20167,14 +21372,13 @@ class MemoryServer:
                 tool_outputs = []
                 for tu in tool_uses:
                     input_data = getattr(tu, "input", {}) or {}
-                    result_obj = get_more_context(
-                        input_data.get("session_id", 0),
-                        raw_sessions=self._raw_sessions,
-                        page=input_data.get("page"),
-                        continuation_handle=input_data.get("continuation_handle"),
-                        recall_continuation_pages=continuation_pages,
-                        recall_continuation_handle=continuation_handle,
+                    result_obj = self._execute_get_more_context_tool(
+                        input_data,
+                        continuation_pages=continuation_pages,
+                        continuation_handle=continuation_handle,
                         continuation_state=continuation_state,
+                        continuation_acl=continuation_acl,
+                        caller_id=caller_id,
                     ) if tu.name == "get_more_context" else json.loads(
                         json.dumps({"error": f"Unknown tool: {tu.name}"})
                     )
@@ -20229,14 +21433,13 @@ class MemoryServer:
             for tc in tool_calls:
                 args = json.loads(tc.function.arguments)
                 if tc.function.name == "get_more_context":
-                    tool_result = get_more_context(
-                        args.get("session_id", 0),
-                        raw_sessions=self._raw_sessions,
-                        page=args.get("page"),
-                        continuation_handle=args.get("continuation_handle"),
-                        recall_continuation_pages=continuation_pages,
-                        recall_continuation_handle=continuation_handle,
+                    tool_result = self._execute_get_more_context_tool(
+                        args,
+                        continuation_pages=continuation_pages,
+                        continuation_handle=continuation_handle,
                         continuation_state=continuation_state,
+                        continuation_acl=continuation_acl,
+                        caller_id=caller_id,
                     )
                     if hasattr(self, "_audit"):
                         self._audit.log(
@@ -20398,6 +21601,12 @@ class MemoryServer:
             payload["_recall_continuation_handle"] = (
                 (recall_result.get("recall_continuation") or {}).get("handle")
             )
+            payload["_recall_continuation_acl"] = {
+                "caller_id": effective_caller_id,
+                "caller_memberships": list(caller_memberships or []),
+                "caller_role": caller_role,
+                "swarm_id": swarm_id,
+            }
 
         estimated_cost_raw = self._estimate_payload_cost(payload=payload, payload_meta=payload_meta)
         estimated_cost = round(estimated_cost_raw, 6) if estimated_cost_raw is not None else 0.0

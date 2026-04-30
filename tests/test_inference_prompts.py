@@ -41,7 +41,7 @@ def test_tool_prompt():
     assert "get_more_context" in text
     assert "RECALL CONTINUATION AVAILABLE" in text
     assert 'page="next"' in text
-    assert "without session_id" in text
+    assert "recall_continuation handle" in text
 
 
 def test_tool_prompt_uses_conditional_recency_policy_like_hybrid():

@@ -97,3 +97,18 @@ def test_get_more_context_continuation_pages():
     assert first["page"] == 2
     assert second["result"] == "page three evidence"
     assert second["exhausted"] is True
+
+
+def test_get_more_context_accepts_generic_handle_alias():
+    page = get_more_context(
+        raw_sessions=[],
+        page="next",
+        handle="h1",
+        recall_continuation_pages=[
+            {"page": 2, "context": "generic handle page", "next_page": None, "exhausted": True},
+        ],
+        recall_continuation_handle="h1",
+    )
+
+    assert page["result"] == "generic handle page"
+    assert page["handle"] == "h1"

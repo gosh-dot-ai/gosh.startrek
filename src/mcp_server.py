@@ -887,10 +887,10 @@ def _public_recall_continuation(continuation: dict | None) -> dict | None:
         return None
     public = deepcopy(continuation)
     if public.get("available"):
-        public["tool"] = "memory_recall"
-        public["mcp_tool"] = "memory_recall"
+        public["tool"] = "get_more_context"
+        public["mcp_tool"] = "get_more_context"
         public["tool_usage"] = (
-            "call memory_recall with continuation_handle=<handle> and page=\"next\" "
+            "call get_more_context with handle=<handle> and page=\"next\" "
             "to fetch the next evidence page"
         )
     return public
@@ -901,7 +901,7 @@ def _public_recall_continuation_instruction(handle: str | None = None) -> str:
     if handle:
         handle_text = str(handle)
     return (
-        "call memory_recall with continuation_handle="
+        "call get_more_context with handle="
         f"\"{handle_text}\" and page=\"next\" to fetch the next evidence page"
     )
 
@@ -918,6 +918,8 @@ def _public_recall_context(context: str, continuation: dict | None) -> str:
             _public_recall_continuation_instruction(handle),
         "call get_more_context with page=\"next\" or no session_id to fetch the next page":
             _public_recall_continuation_instruction(handle).replace("evidence page", "page"),
+        "call memory_recall with continuation_handle=<handle> and page=\"next\" to fetch the next evidence page":
+            _public_recall_continuation_instruction(handle),
     }
     for old, new in replacements.items():
         text = text.replace(old, new)
@@ -931,8 +933,8 @@ def _public_answer_contract(contract: dict | None) -> dict | None:
     continuation = public.get("recall_continuation")
     if isinstance(continuation, dict) and continuation.get("available"):
         handle = str(continuation.get("handle") or "")
-        continuation["tool"] = "memory_recall"
-        continuation["mcp_tool"] = "memory_recall"
+        continuation["tool"] = "get_more_context"
+        continuation["mcp_tool"] = "get_more_context"
         continuation["instruction"] = (
             "The returned context is the first evidence page. If the answer is not present "
             "and more evidence is available, "
@@ -941,10 +943,7 @@ def _public_answer_contract(contract: dict | None) -> dict | None:
         public["recall_continuation"] = continuation
         prompt_template = public.get("prompt_template")
         if isinstance(prompt_template, str):
-            public["prompt_template"] = _public_recall_context(prompt_template, continuation).replace(
-                "get_more_context",
-                "memory_recall",
-            )
+            public["prompt_template"] = _public_recall_context(prompt_template, continuation)
     return public
 
 
@@ -989,9 +988,12 @@ async def memory_recall(
     outside memory_recall.
 
     If a response includes recall_continuation.available=true, fetch later
-    evidence pages by calling memory_recall again with continuation_handle and
-    page="next". This is the public MCP paging path; get_more_context is only an
-    internal inference tool used by memory_ask payloads.
+    evidence pages by calling get_more_context with
+    handle=<recall_continuation.handle> and page="next". The handle is
+    family-agnostic: callers do not pass conversation/document/codebase
+    internals. The older memory_recall continuation_handle path remains
+    accepted for compatibility, but get_more_context is the preferred public
+    paging contract.
 
     Do not generate code changes from absent evidence. If repeated focused
     recall calls cannot provide the required evidence, report the precise
@@ -1041,6 +1043,7 @@ async def memory_recall(
             caller_memberships=_memberships,
             caller_role=ictx.caller_role,
             swarm_id=swarm_id,
+            bind_swarm_from_handle=True,
         )
         if result.get("error") or result.get("code"):
             return {
@@ -1149,6 +1152,108 @@ async def memory_recall(
     if "recall_continuation" in result:
         resp["recall_continuation"] = _public_recall_continuation(result["recall_continuation"])
     return resp
+
+
+def _find_memory_for_recall_continuation(handle: str, key: str | None = None) -> MemoryServer | None:
+    normalized_handle = str(handle or "").strip()
+    if not normalized_handle:
+        return None
+    if key and str(key).strip():
+        return _get_memory(str(key).strip())
+    with _registry_lock:
+        servers = list(registry.values())
+    for server in servers:
+        continuations = getattr(server, "_recall_continuations", {})
+        if isinstance(continuations, dict) and normalized_handle in continuations:
+            return server
+    return None
+
+
+@mcp.tool(name="get_more_context")
+@_safe_tool
+async def get_more_context(
+    handle: str = "",
+    page: int | str | None = "next",
+    key: str = "",
+    agent_id: str = "default",
+    swarm_id: str | None = None,
+    continuation_handle: str | None = None,
+    token: str = None,
+    agent_key: str = None,
+) -> dict:
+    """Fetch the next family-agnostic recall continuation page.
+
+    Preferred call shape:
+        get_more_context(handle=<recall_continuation.handle>, page="next")
+
+    The handle is opaque: callers do not pass conversation, document, codebase,
+    source, file, cursor internals, or the first recall swarm_id. The legacy
+    memory_recall continuation_handle path remains accepted for compatibility.
+    """
+    resolved_handle = str(handle or continuation_handle or "").strip()
+    if not resolved_handle:
+        return {"error": "handle is required", "code": "MISSING_HANDLE"}
+
+    identity_swarm_id = swarm_id or "default"
+    ictx = _resolve_identity(agent_id=agent_id, swarm_id=identity_swarm_id, token=token, agent_key=agent_key)
+    auth_error = _require_authenticated_principal(ictx)
+    if auth_error:
+        return auth_error
+
+    server = _find_memory_for_recall_continuation(resolved_handle, key=key)
+    if server is None:
+        return {
+            "error": "Recall continuation not found",
+            "code": "RECALL_CONTINUATION_NOT_FOUND",
+            "recall_continuation": {
+                "available": False,
+                "handle": resolved_handle,
+                "exhausted": True,
+            },
+        }
+
+    denied = _check_instance_acl(
+        server,
+        ictx.owner_id,
+        "read",
+        ictx.caller_role,
+        ictx.memberships,
+        include_derived=True,
+    )
+    if denied:
+        return denied
+
+    result = server.recall_continuation_page(
+        continuation_handle=resolved_handle,
+        page=page or "next",
+        caller_id=ictx.owner_id,
+        caller_memberships=_ctx_memberships(ictx),
+        caller_role=ictx.caller_role,
+        swarm_id=swarm_id,
+        bind_swarm_from_handle=True,
+    )
+    if result.get("error") or result.get("code"):
+        return {
+            "error": result.get("error", "Recall continuation failed"),
+            "code": result.get("code", "RECALL_CONTINUATION_ERROR"),
+            "recall_continuation": _public_recall_continuation(result.get("recall_continuation")) or {},
+            "runtime_trace": result.get("runtime_trace", {}),
+        }
+    continuation = _public_recall_continuation(result.get("recall_continuation")) or {}
+    context = _public_recall_context(str(result.get("context") or ""), continuation)
+    return {
+        "telemetry_version": 1,
+        "context": context,
+        "entries_rendered": (
+            (result.get("runtime_trace") or {})
+            .get("recall_continuation_trace", {})
+            .get("entries_rendered", 0)
+        ),
+        "query_type": result.get("query_type", "continuation"),
+        "token_estimate": len(context) // 4,
+        "recall_continuation": continuation,
+        "runtime_trace": result.get("runtime_trace", {}),
+    }
 
 
 @mcp.tool(name="memory_plan_inference")

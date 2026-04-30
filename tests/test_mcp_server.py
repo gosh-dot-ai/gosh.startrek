@@ -24,6 +24,7 @@ from src.mcp_server import (
     _get_memory,
     courier_subscribe,
     courier_unsubscribe,
+    get_more_context,
     mcp,
     memory_ask,
     memory_build_index,
@@ -232,6 +233,7 @@ def test_list_tools_returns_all():
     names = {t.name for t in result}
     expected = {
         "memory_store", "memory_write", "memory_write_status", "memory_recall", "memory_plan_inference",
+        "get_more_context",
         "memory_ingest_document", "memory_ingest",
         "memory_ingest_asserted_facts",
         "memory_build_index", "memory_flush", "memory_migrate_jsonnpz", "memory_stats",
@@ -1116,12 +1118,12 @@ def test_memory_recall_omits_inference_planning_hints_from_mcp_response(monkeypa
     assert "secret_ref" not in result
     assert result["recall_continuation"]["available"] is True
     assert result["recall_continuation"]["handle"] == "opaque"
-    assert result["recall_continuation"]["tool"] == "memory_recall"
-    assert result["recall_continuation"]["mcp_tool"] == "memory_recall"
-    assert "get_more_context" not in result["recall_continuation"]["tool_usage"]
+    assert result["recall_continuation"]["tool"] == "get_more_context"
+    assert result["recall_continuation"]["mcp_tool"] == "get_more_context"
+    assert "get_more_context" in result["recall_continuation"]["tool_usage"]
 
 
-def test_memory_recall_public_continuation_pages_through_memory_recall(monkeypatch):
+def test_memory_recall_public_continuation_pages_through_get_more_context(monkeypatch):
     writer_token = _principal_token("recall-continuation-writer")
     asyncio.run(memory_store(
         key="recall_public_continuation",
@@ -1187,17 +1189,16 @@ def test_memory_recall_public_continuation_pages_through_memory_recall(monkeypat
         token=writer_token,
     ))
 
-    assert first["recall_continuation"]["tool"] == "memory_recall"
-    assert first["recall_continuation"]["mcp_tool"] == "memory_recall"
-    assert "continuation_handle=\"opaque-public\"" in first["context"]
-    assert "get_more_context" not in first["context"]
-    assert first["answer_contract"]["recall_continuation"]["tool"] == "memory_recall"
-    assert "get_more_context" not in first["answer_contract"]["recall_continuation"]["instruction"]
-    assert "get_more_context" not in first["answer_contract"]["prompt_template"]
+    assert first["recall_continuation"]["tool"] == "get_more_context"
+    assert first["recall_continuation"]["mcp_tool"] == "get_more_context"
+    assert 'handle="opaque-public"' in first["context"]
+    assert "get_more_context" in first["context"]
+    assert first["answer_contract"]["recall_continuation"]["tool"] == "get_more_context"
+    assert "get_more_context" in first["answer_contract"]["recall_continuation"]["instruction"]
+    assert "get_more_context" in first["answer_contract"]["prompt_template"]
 
-    second = asyncio.run(memory_recall(
-        key="recall_public_continuation",
-        continuation_handle="opaque-public",
+    second = asyncio.run(get_more_context(
+        handle="opaque-public",
         page="next",
         token=writer_token,
     ))
@@ -1208,6 +1209,87 @@ def test_memory_recall_public_continuation_pages_through_memory_recall(monkeypat
     assert second["recall_continuation"]["exhausted"] is True
     assert "payload" not in second
     assert "payload_meta" not in second
+
+
+def test_get_more_context_uses_handle_bound_swarm_when_omitted(monkeypatch):
+    writer_token = _principal_token("recall-continuation-team-writer")
+    asyncio.run(memory_store(
+        key="recall_team_continuation",
+        content="Project Alpha team workflow checkpoint.",
+        session_num=1,
+        session_date="2024-06-01",
+        scope="agent-private",
+        swarm_id="team-gosh",
+        token=writer_token,
+    ))
+    server = mod.registry["recall_team_continuation"]
+
+    async def fake_recall(**kwargs):
+        assert kwargs["swarm_id"] == "team-gosh"
+        return {
+            "context": "RETRIEVED FACTS:\n- Project Alpha team workflow checkpoint.",
+            "retrieved": [],
+            "query_type": "lookup",
+            "runtime_trace": {"evidence_context": {"finalized": True}},
+            "_recall_continuation_pages": [
+                {
+                    "page": 2,
+                    "next_page": None,
+                    "exhausted": True,
+                    "context": "RECALL CONTINUATION PAGE 2:\nRETRIEVED FACTS:\n- Team Alpha ships Friday.",
+                    "returned_count": 1,
+                }
+            ],
+            "recall_continuation": {
+                "available": True,
+                "handle": "opaque-team-gosh",
+                "next_page": 2,
+                "page_size": 5,
+                "candidate_count": 6,
+                "returned_count": 5,
+                "exhausted": False,
+                "anchor_terms": ["project", "alpha"],
+                "tool": "get_more_context",
+                "tool_usage": (
+                    "call get_more_context with handle=<handle> and page=\"next\" "
+                    "to fetch the next evidence page"
+                ),
+            },
+        }
+
+    monkeypatch.setattr(server, "recall", fake_recall)
+
+    first = asyncio.run(memory_recall(
+        key="recall_team_continuation",
+        query="When does Project Alpha ship?",
+        swarm_id="team-gosh",
+        token=writer_token,
+    ))
+
+    assert first["recall_continuation"]["handle"] == "opaque-team-gosh"
+
+    second = asyncio.run(get_more_context(
+        handle="opaque-team-gosh",
+        page="next",
+        token=writer_token,
+    ))
+
+    assert second.get("code") is None
+    assert "Team Alpha ships Friday" in second["context"]
+    trace = second["runtime_trace"]["recall_continuation_trace"]
+    assert trace["handle_bound_swarm_id"] is True
+
+
+def test_get_more_context_invalid_handle_returns_structured_error():
+    result = asyncio.run(get_more_context(
+        handle="missing-continuation-handle",
+        page="next",
+        token=_principal_token("missing-continuation-reader"),
+    ))
+
+    assert result["code"] == "RECALL_CONTINUATION_NOT_FOUND"
+    assert result["recall_continuation"]["available"] is False
+    assert result["recall_continuation"]["exhausted"] is True
 
 
 def test_memory_write_exposes_raw_recall_and_status(tmp_path):

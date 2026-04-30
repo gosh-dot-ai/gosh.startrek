@@ -8,8 +8,10 @@
 
 from __future__ import annotations
 
+import json
 import textwrap
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -17,6 +19,7 @@ import pytest
 from src.episode_extraction import build_singleton_episodes
 from src.ingest import ingest_input
 from src.memory import MemoryServer
+from src.codebase_semantic_sidecars import CodebaseSemanticSidecarStore
 from tests._memory_llm_mocks import patch_memory_llm_runtime
 
 
@@ -44,6 +47,12 @@ def _semantic_vec(text: str, *, dim: int = 24) -> np.ndarray:
         "qualified",
         "python",
         "function",
+        "leather",
+        "jacket",
+        "sales",
+        "statistics",
+        "auth",
+        "payment",
     ]
     vec = np.zeros(dim, dtype=np.float32)
     for idx, key in enumerate(keys):
@@ -115,6 +124,43 @@ def _create_cinder_codebase_repo(tmp_path: Path) -> Path:
     return repo
 
 
+def _create_leather_codebase_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "leather_code_repo"
+    (repo / "pkg").mkdir(parents=True)
+    (repo / "pyproject.toml").write_text("[project]\nname='leather-code-repo'\n", encoding="utf-8")
+    (repo / "pkg" / "leather_jacket_sales.py").write_text(
+        textwrap.dedent(
+            """\
+            LEATHER_JACKET_SALES_STATISTICS = {"reviews": 128, "sales": 42}
+
+            def leather(jacket):
+                return LEATHER_JACKET_SALES_STATISTICS
+            """
+        ),
+        encoding="utf-8",
+    )
+    return repo
+
+
+def _create_unrelated_codebase_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "unrelated_code_repo"
+    (repo / "pkg").mkdir(parents=True)
+    (repo / "pyproject.toml").write_text("[project]\nname='unrelated-code-repo'\n", encoding="utf-8")
+    (repo / "pkg" / "payments.py").write_text(
+        textwrap.dedent(
+            """\
+            def authorize_payment(user_id: str, cents: int) -> bool:
+                return bool(user_id and cents > 0)
+
+            def rotate_auth_token(token: str) -> str:
+                return token[::-1]
+            """
+        ),
+        encoding="utf-8",
+    )
+    return repo
+
+
 def _patch_public_runtime(monkeypatch):
     async def mock_extract_session(**kwargs):
         text = str(kwargs.get("session_text") or "")
@@ -132,6 +178,12 @@ def _patch_public_runtime(monkeypatch):
         elif "owner team for cinder-42 is platform reliability" in lowered:
             fact_text = "The document says the owner team for CINDER-42 is Platform Reliability."
             entities = ["CINDER-42", "Platform Reliability", "owner team"]
+        elif "leather jacket reviews" in lowered:
+            fact_text = "The conversation says Leather Jacket reviews are rising."
+            entities = ["Leather Jacket", "reviews"]
+        elif "leather jacket product brief" in lowered:
+            fact_text = "The document describes Leather Jacket product demand."
+            entities = ["Leather Jacket", "product demand"]
         else:
             fact_text = text.splitlines()[0].strip() if text.strip() else "fallback fact"
             entities = ["generic"]
@@ -227,6 +279,31 @@ async def _build_cinder_mixed_corpus(server: MemoryServer, tmp_path: Path, monke
     return repo
 
 
+async def _build_leather_multifamily_corpus(
+    server: MemoryServer,
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    codebase_related: bool = True,
+) -> Path:
+    _patch_public_runtime(monkeypatch)
+    repo = _create_leather_codebase_repo(tmp_path) if codebase_related else _create_unrelated_codebase_repo(tmp_path)
+    await server.store(
+        "User: Leather Jacket reviews are rising. Assistant: Noted.",
+        session_num=1,
+        session_date="2024-06-01",
+        source_id="CHAT",
+        scope="agent-private",
+    )
+    await server.ingest_document(
+        "# Leather Jacket Product Brief\n\nLeather Jacket product brief: demand is up.",
+        source_id="DOC",
+        scope="agent-private",
+    )
+    await server.ingest_codebase(str(repo), source_id="CODE", scope="agent-private")
+    return repo
+
+
 @pytest.mark.asyncio
 async def test_ingest_input_codebase_manifest_only_repo_uses_ecosystem_semantics(tmp_path):
     repo = tmp_path / "manifest_repo"
@@ -300,6 +377,8 @@ async def test_code_query_with_family_hint_stays_in_codebase_lane(tmp_path, monk
     assert "Sam discussed issue planning in conversation." not in result["context"]
     assert "The document says the permit checklist is required for issue triage." not in result["context"]
     assert result["runtime_trace"]["codebase_augmentation"]["mode"] == "whole_file"
+    assert result["runtime_trace"]["family_discovery"]["source_hydration"]["hydrated"] is True
+    assert result["runtime_trace"]["family_discovery"]["source_hydration"]["hydrated"] is True
 
 
 @pytest.mark.asyncio
@@ -314,6 +393,7 @@ async def test_conversation_query_with_family_hint_stays_out_of_codebase_lane(tm
     assert "[File: pkg/service.py]" not in result["context"]
     assert "(S1)" in result["context"]
     assert result["runtime_trace"]["codebase_augmentation"]["mode"] == "inactive"
+    assert result["runtime_trace"]["family_discovery"]["per_family"]["codebase"]["searched"] is False
 
 
 @pytest.mark.asyncio
@@ -327,6 +407,7 @@ async def test_document_query_with_family_hint_stays_out_of_codebase_lane(tmp_pa
     assert "--- SOURCE FILES ---" not in result["context"]
     assert "[File: pkg/service.py]" not in result["context"]
     assert result["runtime_trace"]["codebase_augmentation"]["mode"] == "inactive"
+    assert result["runtime_trace"]["family_discovery"]["per_family"]["codebase"]["searched"] is False
 
 
 @pytest.mark.asyncio
@@ -339,6 +420,310 @@ async def test_generic_mixed_query_does_not_hydrate_code_when_only_conversation_
     assert "Sam discussed issue planning in conversation." in result["context"]
     assert "--- SOURCE FILES ---" not in result["context"]
     assert result["runtime_trace"]["codebase_augmentation"]["mode"] == "inactive"
+
+
+@pytest.mark.asyncio
+async def test_generic_auto_short_query_discovers_codebase_without_code_markers(tmp_path, monkeypatch):
+    server = _make_server(tmp_path, key="generic_auto_leather_codebase")
+    await _build_leather_multifamily_corpus(server, tmp_path, monkeypatch)
+
+    result = await server.recall("Leather Jacket")
+
+    assert "The conversation says Leather Jacket reviews are rising." in result["context"]
+    assert "The document describes Leather Jacket product demand." in result["context"]
+    assert "--- CODEBASE FACTS ---" in result["context"]
+    assert "def leather(jacket):" in result["context"]
+    assert "--- SOURCE FILES ---" not in result["context"]
+    trace = result["runtime_trace"]["family_discovery"]
+    assert {"conversation", "document", "codebase"} <= set(trace["available_families"])
+    assert "codebase" in trace["searched_families"]
+    assert trace["per_family"]["codebase"]["mode"] == "codebase_cheap_probe"
+    assert trace["per_family"]["codebase"]["candidate_count"] > 0
+    assert trace["per_family"]["codebase"]["selected_count"] > 0
+    assert trace["per_family"]["codebase"]["score_summary"]["threshold"]["min_overlap"] == 2
+    assert trace["source_hydration"]["hydrated"] is False
+
+
+@pytest.mark.asyncio
+async def test_codebase_hot_recall_continuation_returns_source_window_without_first_page_hydration(tmp_path, monkeypatch):
+    server = _make_server(tmp_path, key="codebase_continuation_source_window")
+    repo = _create_leather_codebase_repo(tmp_path)
+    await server.ingest_codebase(str(repo), source_id="CODE", scope="agent-private")
+
+    hydrate_calls: list[str] = []
+    original = CodebaseSemanticSidecarStore.hydrate_sidecar
+
+    def _recording_hydrate(self, sidecar_ref):
+        hydrate_calls.append(str(sidecar_ref.get("sidecar_id") or ""))
+        return original(self, sidecar_ref)
+
+    monkeypatch.setattr(CodebaseSemanticSidecarStore, "hydrate_sidecar", _recording_hydrate)
+
+    result = await server.recall("Leather Jacket sales statistics", search_family="codebase")
+
+    assert "LEATHER_JACKET_SALES_STATISTICS" in result["context"]
+    assert "--- SOURCE FILES ---" not in result["context"]
+    assert hydrate_calls == []
+    continuation = result["recall_continuation"]
+    assert continuation["available"] is True
+    assert continuation["typed_entry_counts"]["codebase_source"] > 0
+    assert result["runtime_trace"]["recall_continuation_trace"]["families_with_continuation"] == ["codebase"]
+    for continuation_page in result["_recall_continuation_pages"]:
+        assert "context" not in continuation_page
+        for entry in continuation_page["typed_entries"]:
+            assert "raw" not in entry
+            assert "content" not in entry
+            sidecar_ref = entry.get("file_sidecar_ref") or {}
+            assert "code" not in sidecar_ref
+            assert "text" not in sidecar_ref
+
+    page = server.recall_continuation_page(
+        continuation_handle=continuation["handle"],
+        page="next",
+        caller_id="system",
+        caller_memberships=[],
+        caller_role="user",
+        swarm_id="default",
+    )
+
+    assert "CODEBASE SOURCE WINDOWS:" in page["context"]
+    assert "[Mode: source_window]" in page["context"]
+    assert "LEATHER_JACKET_SALES_STATISTICS" in page["context"]
+    assert "--- SOURCE FILES ---" not in page["context"]
+    assert hydrate_calls
+    page_trace = page["runtime_trace"]["recall_continuation_trace"]
+    assert page_trace["typed_entry_counts"]["codebase_source"] > 0
+    assert page_trace["source_hydration"]["hydrated"] is True
+
+
+@pytest.mark.asyncio
+async def test_memory_ask_tool_continuation_hydrates_codebase_source_windows(tmp_path, monkeypatch):
+    server = _make_server(tmp_path, key="codebase_ask_continuation_source_window")
+    server._profiles = {1: "qwen"}
+    server._profile_configs["qwen"].update({
+        "context_window": 128000,
+        "max_output_tokens": 512,
+        "secret_ref": {"name": "test-runtime-secret", "scope": "system-wide"},
+        "pricing": {"input_per_1k": 0.0, "output_per_1k": 0.0},
+    })
+    repo = _create_leather_codebase_repo(tmp_path)
+    await server.ingest_codebase(str(repo), source_id="CODE", scope="agent-private")
+
+    hydrate_calls: list[str] = []
+    original = CodebaseSemanticSidecarStore.hydrate_sidecar
+
+    def _recording_hydrate(self, sidecar_ref):
+        hydrate_calls.append(str(sidecar_ref.get("sidecar_id") or ""))
+        return original(self, sidecar_ref)
+
+    monkeypatch.setattr(CodebaseSemanticSidecarStore, "hydrate_sidecar", _recording_hydrate)
+
+    class _FakeCompletions:
+        def __init__(self):
+            self.calls = 0
+
+        async def create(self, **request):
+            self.calls += 1
+            if self.calls == 1:
+                tool_call = SimpleNamespace(
+                    id="call_more_context",
+                    function=SimpleNamespace(
+                        name="get_more_context",
+                        arguments=json.dumps({"page": "next"}),
+                    ),
+                )
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=[tool_call]))]
+                )
+
+            tool_messages = [
+                str(message.get("content") or "")
+                for message in request.get("messages", [])
+                if isinstance(message, dict) and message.get("role") == "tool"
+            ]
+            assert tool_messages
+            tool_payload = "\n".join(tool_messages)
+            assert "CODEBASE SOURCE WINDOWS:" in tool_payload
+            assert "[Mode: source_window]" in tool_payload
+            assert "LEATHER_JACKET_SALES_STATISTICS" in tool_payload
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content="LEATHER_JACKET_SALES_STATISTICS",
+                            tool_calls=[],
+                        )
+                    )
+                ]
+            )
+
+    fake_completions = _FakeCompletions()
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=fake_completions))
+    monkeypatch.setattr(server, "_get_model_client_with_runtime_secrets", lambda *_args, **_kwargs: fake_client)
+
+    result = await server.ask(
+        "Leather Jacket sales statistics",
+        search_family="codebase",
+        use_tool=True,
+    )
+
+    assert result["tool_called"] is True
+    assert fake_completions.calls == 2
+    assert hydrate_calls
+    tool_result = json.loads(result["tool_results"][0]["result"])
+    assert "CODEBASE SOURCE WINDOWS:" in tool_result["result"]
+    assert "LEATHER_JACKET_SALES_STATISTICS" in tool_result["result"]
+    assert tool_result["runtime_trace"]["recall_continuation_trace"]["source_hydration"]["hydrated"] is True
+
+
+def test_codebase_continuation_falls_back_to_fact_refs_when_source_window_unavailable(tmp_path):
+    server = MemoryServer(str(tmp_path / "data"), "codebase_continuation_fact_fallback")
+    fact = {
+        "id": "code-fact-no-source",
+        "fact": "Codebase config declares Leather Jacket sale statistics in generated metadata.",
+        "kind": "fact",
+        "source_id": "CODE",
+        "source_family": "codebase",
+        "scope": "agent-private",
+        "owner_id": "system",
+        "agent_id": "default",
+        "swarm_id": "default",
+    }
+    server._source_records["CODE"] = {
+        "source_id": "CODE",
+        "family": "codebase",
+        "scope": "agent-private",
+        "owner_id": "system",
+        "agent_id": "default",
+        "swarm_id": "default",
+        "read": [],
+        "write": [],
+    }
+    server._all_granular = [fact]
+
+    result = server._attach_recall_continuation(
+        query="Leather Jacket statistics",
+        result={
+            "context": "RETRIEVED FACTS:\n- Codebase config declares Leather Jacket sale statistics.",
+            "retrieved": [fact],
+            "query_type": "lookup",
+            "search_family": "codebase",
+            "retrieval_families": ["codebase"],
+            "runtime_trace": {},
+        },
+        fact_filter=lambda row: server._acl_allows(row, "system", [], "user"),
+        caller_id="system",
+        caller_memberships=[],
+        caller_role="user",
+        swarm_id="default",
+        raw_kind="all",
+    )
+
+    assert result["recall_continuation"]["available"] is True
+    assert result["recall_continuation"]["typed_entry_counts"] == {"codebase_fact": 1}
+    assert "no_codebase_sidecar_ref" in result["runtime_trace"]["recall_continuation_trace"]["skipped_reasons"]
+
+    page = server.recall_continuation_page(
+        continuation_handle=result["recall_continuation"]["handle"],
+        page="next",
+        caller_id="system",
+        caller_memberships=[],
+        caller_role="user",
+        swarm_id="default",
+    )
+
+    assert "CODEBASE FACTS:" in page["context"]
+    assert "Leather Jacket sale statistics" in page["context"]
+    assert "source_window_reason=no_codebase_sidecar_ref" in page["context"]
+    assert page["runtime_trace"]["recall_continuation_trace"]["source_hydration"]["hydrated"] is False
+
+
+@pytest.mark.asyncio
+async def test_generic_auto_mixed_recall_uses_one_family_agnostic_continuation_handle(tmp_path, monkeypatch):
+    server = _make_server(tmp_path, key="generic_auto_single_continuation_handle")
+    await _build_leather_multifamily_corpus(server, tmp_path, monkeypatch)
+
+    result = await server.recall("Leather Jacket")
+
+    assert "The conversation says Leather Jacket reviews are rising." in result["context"]
+    assert "The document describes Leather Jacket product demand." in result["context"]
+    assert "--- CODEBASE FACTS ---" in result["context"]
+    continuation = result["recall_continuation"]
+    assert continuation["available"] is True
+    assert continuation["tool"] == "get_more_context"
+    assert continuation["typed_entry_counts"]["codebase_source"] > 0
+
+    page = server.recall_continuation_page(
+        continuation_handle=continuation["handle"],
+        page="next",
+        caller_id="system",
+        caller_memberships=[],
+        caller_role="user",
+        swarm_id="default",
+    )
+
+    assert "CODEBASE SOURCE WINDOWS:" in page["context"]
+    assert "The conversation says Leather Jacket reviews are rising." not in page["context"]
+    assert page["runtime_trace"]["recall_continuation_trace"]["handle_version"] == 2
+    assert page["runtime_trace"]["recall_continuation_trace"]["has_more"] in {True, False}
+
+
+@pytest.mark.asyncio
+async def test_generic_auto_unrelated_codebase_does_not_pollute_context(tmp_path, monkeypatch):
+    server = _make_server(tmp_path, key="generic_auto_leather_unrelated_codebase")
+    await _build_leather_multifamily_corpus(server, tmp_path, monkeypatch, codebase_related=False)
+
+    result = await server.recall("Leather Jacket")
+
+    assert "The conversation says Leather Jacket reviews are rising." in result["context"]
+    assert "The document describes Leather Jacket product demand." in result["context"]
+    assert "--- CODEBASE FACTS ---" not in result["context"]
+    assert "authorize_payment" not in result["context"]
+    assert "--- SOURCE FILES ---" not in result["context"]
+    trace = result["runtime_trace"]["family_discovery"]
+    assert trace["per_family"]["codebase"]["searched"] is True
+    assert trace["per_family"]["codebase"]["selected_count"] == 0
+    assert trace["per_family"]["codebase"]["skipped_reason"] in {
+        "no_probe_candidates",
+        "filtered_below_overlap_threshold",
+    }
+    assert trace["source_hydration"]["hydrated"] is False
+
+
+@pytest.mark.asyncio
+async def test_generic_auto_does_not_full_scan_codebase_lookup_when_probe_misses(tmp_path, monkeypatch):
+    server = _make_server(tmp_path, key="generic_auto_no_hidden_full_scan")
+    await _build_leather_multifamily_corpus(server, tmp_path, monkeypatch)
+    original_generic_fact_recall = server._generic_fact_recall
+
+    async def mock_generic_fact_recall(**kwargs):
+        if kwargs.get("search_family") == "codebase" and kwargs.get("codebase_probe_mode") is True:
+            return {
+                "context": "RETRIEVED FACTS:",
+                "retrieved": [],
+                "search_family": "codebase",
+                "retrieval_families": [],
+                "runtime_trace": {
+                    "runtime": "fact",
+                    "reason": "forced_probe_miss_for_regression",
+                },
+            }
+        return await original_generic_fact_recall(**kwargs)
+
+    monkeypatch.setattr(server, "_generic_fact_recall", mock_generic_fact_recall)
+
+    result = await server.recall("Leather Jacket")
+
+    assert "The conversation says Leather Jacket reviews are rising." in result["context"]
+    assert "The document describes Leather Jacket product demand." in result["context"]
+    assert "--- CODEBASE FACTS ---" not in result["context"]
+    assert "def leather(jacket):" not in result["context"]
+    trace = result["runtime_trace"]["family_discovery"]
+    assert trace["per_family"]["codebase"]["searched"] is True
+    assert trace["per_family"]["codebase"]["visible_fact_count"] > 0
+    assert trace["per_family"]["codebase"]["candidate_count"] == 0
+    assert trace["per_family"]["codebase"]["selected_count"] == 0
+    assert trace["per_family"]["codebase"]["skipped_reason"] == "no_probe_candidates"
 
 
 @pytest.mark.asyncio
@@ -375,6 +760,7 @@ async def test_auto_mixed_query_merges_conversation_document_and_codebase(tmp_pa
     assert "[File: pkg/service.py]" in result["context"]
     assert "def cinder_signature() -> str:" in result["context"]
     assert result["runtime_trace"]["codebase_augmentation"]["mode"] == "whole_file"
+    assert result["runtime_trace"]["family_discovery"]["source_hydration"]["hydrated"] is True
     assert result["runtime_trace"]["mixed_family_merge"]["mode"] == "auto"
     assert set(result["runtime_trace"]["mixed_family_merge"]["lanes"]) == {"episode", "codebase"}
     assert {"conversation", "document", "codebase"} <= set(result["runtime_trace"]["mixed_family_merge"]["merged_families"])
@@ -426,6 +812,10 @@ async def test_explicit_codebase_query_stays_code_only_in_cinder_mixed_corpus(tm
     assert "Platform Reliability" not in result["context"]
     assert "The chat says the incident codename is CINDER-42." not in result["context"]
     assert result["search_family"] == "codebase"
+    trace = result["runtime_trace"]["family_discovery"]
+    assert trace["per_family"]["codebase"]["searched"] is True
+    assert trace["per_family"]["conversation"]["searched"] is False
+    assert trace["per_family"]["document"]["searched"] is False
 
 
 @pytest.mark.asyncio
@@ -440,6 +830,7 @@ async def test_mixed_query_does_not_regress_narrow_precise_code_auto_behavior(tm
     assert "Platform Reliability" not in result["context"]
     assert "The chat says the incident codename is CINDER-42." not in result["context"]
     assert result["runtime_trace"]["codebase_augmentation"]["mode"] == "whole_file"
+    assert result["runtime_trace"]["family_discovery"]["source_hydration"]["hydrated"] is True
 
 
 @pytest.mark.asyncio

@@ -1737,6 +1737,159 @@ def test_recall_continuation_pages_same_anchor_facts_and_raw(tmp_path):
     assert "Project Alpha release is scheduled for 2026-04-27 at night" in page["result"]
 
 
+def test_recall_continuation_paginates_raw_pages_until_exhausted(tmp_path):
+    ms = MemoryServer(str(tmp_path), "continuation_raw_pages")
+    ms._raw_sessions = [
+        {
+            "message_id": f"raw-alpha-{idx}",
+            "content": f"Project Alpha release raw detail {idx}: evidence payload {idx}.",
+            "format": "conversation",
+            "status": "active",
+            "scope": "agent-private",
+            "owner_id": "tester",
+            "agent_id": "tester",
+            "swarm_id": "default",
+            "session_num": idx,
+            "source_id": "conv-alpha",
+        }
+        for idx in range(1, 14)
+    ]
+
+    continued = ms._attach_recall_continuation(
+        query="Project Alpha release",
+        result={
+            "context": "RETRIEVED FACTS:",
+            "retrieved": [],
+            "query_type": "lookup",
+            "search_family": "conversation",
+            "retrieval_families": ["conversation"],
+            "runtime_trace": {},
+        },
+        fact_filter=lambda fact: ms._acl_allows(fact, "tester", [], "user"),
+        caller_id="tester",
+        caller_memberships=[],
+        caller_role="user",
+        swarm_id="default",
+        raw_kind="all",
+    )
+
+    for continuation_page in continued["_recall_continuation_pages"]:
+        assert "context" not in continuation_page
+        for entry in continuation_page["typed_entries"]:
+            assert "raw" not in entry
+            assert "content" not in entry
+
+    handle = continued["recall_continuation"]["handle"]
+    pages = [
+        ms.recall_continuation_page(
+            continuation_handle=handle,
+            page="next",
+            caller_id="tester",
+            caller_memberships=[],
+            caller_role="user",
+            swarm_id="default",
+        )
+        for _ in range(3)
+    ]
+    exhausted = ms.recall_continuation_page(
+        continuation_handle=handle,
+        page="next",
+        caller_id="tester",
+        caller_memberships=[],
+        caller_role="user",
+        swarm_id="default",
+    )
+
+    assert continued["recall_continuation"]["candidate_count"] == 13
+    assert [page["recall_continuation"]["page"] for page in pages] == [2, 3, 4]
+    assert pages[0]["context"].count("Project Alpha release raw detail") == 5
+    assert pages[1]["context"].count("Project Alpha release raw detail") == 5
+    assert pages[2]["context"].count("Project Alpha release raw detail") == 3
+    page_texts = [page["context"] for page in pages]
+    assert len(set(page_texts)) == 3
+    assert "raw detail 13:" in page_texts[0]
+    assert "raw detail 8:" in page_texts[1]
+    assert "raw detail 3:" in page_texts[2]
+    assert pages[2]["recall_continuation"]["exhausted"] is True
+    assert exhausted["code"] == "RECALL_CONTINUATION_NOT_FOUND"
+
+
+def test_recall_continuation_paginates_fact_candidates_after_initial_top_k(tmp_path):
+    ms = MemoryServer(str(tmp_path), "continuation_fact_pages")
+    facts = [
+        {
+            "id": f"fact-{idx}",
+            "fact": f"Project Alpha release checkpoint fact {idx}.",
+            "kind": "fact",
+            "session": idx,
+            "scope": "agent-private",
+            "owner_id": "tester",
+            "agent_id": "tester",
+            "swarm_id": "default",
+            "source_id": "conv-alpha",
+        }
+        for idx in range(1, 16)
+    ]
+    ms._all_granular = facts
+    initial_top_k = facts[:5]
+
+    continued = ms._attach_recall_continuation(
+        query="Project Alpha release checkpoint",
+        result={
+            "context": "RETRIEVED FACTS:\n" + "\n".join(fact["fact"] for fact in initial_top_k),
+            "retrieved": initial_top_k,
+            "query_type": "lookup",
+            "search_family": "conversation",
+            "retrieval_families": ["conversation"],
+            "runtime_trace": {},
+        },
+        fact_filter=lambda fact: ms._acl_allows(fact, "tester", [], "user"),
+        caller_id="tester",
+        caller_memberships=[],
+        caller_role="user",
+        swarm_id="default",
+        raw_kind="all",
+    )
+
+    handle = continued["recall_continuation"]["handle"]
+    page2 = ms.recall_continuation_page(
+        continuation_handle=handle,
+        page="next",
+        caller_id="tester",
+        caller_memberships=[],
+        caller_role="user",
+        swarm_id="default",
+    )
+    page3 = ms.recall_continuation_page(
+        continuation_handle=handle,
+        page="next",
+        caller_id="tester",
+        caller_memberships=[],
+        caller_role="user",
+        swarm_id="default",
+    )
+    exhausted = ms.recall_continuation_page(
+        continuation_handle=handle,
+        page="next",
+        caller_id="tester",
+        caller_memberships=[],
+        caller_role="user",
+        swarm_id="default",
+    )
+
+    assert continued["recall_continuation"]["candidate_count"] == 10
+    combined = f"{page2['context']}\n{page3['context']}"
+    for fact in initial_top_k:
+        assert fact["fact"] not in combined
+    assert page2["context"].count("Project Alpha release checkpoint fact") == 5
+    assert page3["context"].count("Project Alpha release checkpoint fact") == 5
+    assert page2["context"] != page3["context"]
+    assert page2["recall_continuation"]["page"] == 2
+    assert page3["recall_continuation"]["page"] == 3
+    assert page3["recall_continuation"]["exhausted"] is True
+    assert exhausted["code"] == "RECALL_CONTINUATION_NOT_FOUND"
+
+
 def test_recall_continuation_preserves_acl(tmp_path):
     ms = MemoryServer(str(tmp_path), "continuation_acl")
     visible = {
@@ -1781,10 +1934,49 @@ def test_recall_continuation_preserves_acl(tmp_path):
         swarm_id="default",
         raw_kind="all",
     )
-    page_text = "\n".join(page["context"] for page in continued["_recall_continuation_pages"])
+    page = ms.recall_continuation_page(
+        continuation_handle=continued["recall_continuation"]["handle"],
+        page="next",
+        caller_id="tester",
+        caller_memberships=[],
+        caller_role="user",
+        swarm_id="default",
+    )
+    page_text = page["context"]
 
     assert "visible detail" in page_text
     assert "hidden secret" not in page_text
+
+
+def test_get_more_context_tool_keeps_legacy_session_id_full_text(tmp_path):
+    ms = MemoryServer(str(tmp_path), "continuation_tool_legacy_session")
+    ms._raw_sessions = [
+        {
+            "message_id": "raw-session-1",
+            "content": "Full raw session text for Project Alpha.",
+            "status": "active",
+        }
+    ]
+
+    result = ms._execute_get_more_context_tool(
+        {"session_id": 1},
+        continuation_pages=[
+            {
+                "page": 2,
+                "context": "RECALL CONTINUATION PAGE 2:\n- continuation evidence",
+                "next_page": None,
+                "exhausted": True,
+            }
+        ],
+        continuation_handle="opaque-continuation",
+        continuation_state={"next_page": 2},
+        continuation_acl={},
+        caller_id="tester",
+    )
+
+    assert "Full text of Session 1" in result["result"]
+    assert "Full raw session text for Project Alpha." in result["result"]
+    assert "continuation evidence" not in result["result"]
 
 
 def test_recall_continuation_handles_are_unique_per_recall_and_acl_state(tmp_path):
@@ -5405,3 +5597,149 @@ async def test_write_log_local_cli_timeout_does_not_mark_complete(tmp_path, monk
     assert status["extraction_state"] == "failed"
     assert ms._all_granular == []
     assert any(rs.get("status") == "extraction_failed" for rs in ms._raw_sessions)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# _answer_core_for_grounding — citation/explanation tail stripping
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_answer_core_strips_trailing_sources_block():
+    # Regression: a correct answer with a "Sources: [1] (S3) ..." trailing
+    # block was previously rejected by the strict-all token gate because
+    # the citation tokens (sources, explicitly, S3) inflated the answer
+    # token set. The helper must strip that tail.
+    answer = (
+        "John signed with the Minnesota Wolves on 21 May 2023. "
+        "Sources: [1] (S1) explicitly states John signed with the Minnesota Wolves."
+    )
+    core = memory_mod._answer_core_for_grounding(answer)
+    assert "Minnesota Wolves" in core
+    assert "Sources" not in core
+    assert "[1]" not in core
+    assert "(S1)" not in core
+    assert "explicitly states" not in core
+
+
+def test_answer_core_strips_parenthesized_evidence_tail():
+    # Regression: positive answer with "(Evidence: [1][2] explicitly state...)"
+    # parenthesized tail.
+    answer = (
+        "Evan got a new Prius after his old Prius broke down. "
+        "(Evidence: [1][2] explicitly state he repaired/sold the old Prius.)"
+    )
+    core = memory_mod._answer_core_for_grounding(answer)
+    assert "new Prius" in core
+    assert "Evidence" not in core
+    assert "[1]" not in core
+    assert "[2]" not in core
+
+
+def test_answer_core_strips_according_to_prefix_clause():
+    # "According to ..." prefix clause should be stripped, leaving the
+    # substantive claim. Strip to the first comma/period only — do not
+    # remove the whole sentence.
+    answer = "According to the retrieved facts, the answer is Mary."
+    core = memory_mod._answer_core_for_grounding(answer)
+    assert "Mary" in core
+    assert "According to" not in core
+    assert "retrieved facts" not in core
+
+
+def test_answer_core_preserves_plain_answer():
+    # Non-citation text must pass through unchanged so we do not mask real
+    # hallucinations.
+    answer = "Caroline went to the LGBTQ support group on May 7, 2023."
+    core = memory_mod._answer_core_for_grounding(answer)
+    assert core == answer
+
+
+def test_answer_core_handles_empty_input():
+    assert memory_mod._answer_core_for_grounding("") == ""
+    assert memory_mod._answer_core_for_grounding(None) == ""  # type: ignore[arg-type]
+
+
+def test_answer_core_strips_meta_explanation_tail():
+    # Trailing meta-explanation clauses like "As noted in fact [3], this..."
+    # should be removed.
+    answer = "Maria donated her old car. As noted in fact [3], this happened in December 2023."
+    core = memory_mod._answer_core_for_grounding(answer)
+    assert "old car" in core
+    assert "As noted in fact" not in core
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# _normalize_grounded_answer — gate integration via _answer_core
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _make_recall_with_facts(*fact_texts: str) -> dict:
+    return {
+        "retrieved": [{"fact": text, "id": f"f{i}"} for i, text in enumerate(fact_texts)],
+    }
+
+
+def test_grounded_gate_keeps_correct_answer_with_sources_tail(tmp_path):
+    # Regression: the audit on full1986 found correct answers like
+    # "John signed with the Minnesota Wolves on 21 May 2023. Sources: [1]
+    # (S1) explicitly states ..." were rejected as Not mentioned because
+    # the strict ``all(token in grounding_text)`` rule treated citation
+    # tokens (sources, explicitly, S1) as ungrounded. With the
+    # answer-core strip in place, the gate must keep the answer.
+    ms = MemoryServer(str(tmp_path), "grounded_gate_sources_tail")
+    recall = _make_recall_with_facts(
+        "John signed with the Minnesota Wolves on 2023-05-21.",
+        "John attended a press conference about the Minnesota Wolves signing.",
+    )
+    answer = (
+        "John signed with the Minnesota Wolves on 21 May 2023. "
+        "Sources: [1] (S1) explicitly states John signed."
+    )
+    out = ms._normalize_grounded_answer("What team did John sign with?", answer, recall)
+    assert "Minnesota Wolves" in out
+    assert out != "Not mentioned in the provided context."
+
+
+def test_grounded_gate_keeps_correct_answer_with_evidence_parens(tmp_path):
+    # Regression: positive answer with "(Evidence: [1][2] ...)" tail.
+    ms = MemoryServer(str(tmp_path), "grounded_gate_evidence_parens")
+    recall = _make_recall_with_facts(
+        "Evan got a new Prius after his old Prius broke down.",
+        "Evan repaired and sold the old Prius before getting a new Prius.",
+    )
+    answer = (
+        "Evan got a new Prius after his old Prius broke down. "
+        "(Evidence: [1][2] explicitly state he repaired/sold the old Prius.)"
+    )
+    out = ms._normalize_grounded_answer("What car did Evan get?", answer, recall)
+    assert "Prius" in out
+    assert out != "Not mentioned in the provided context."
+
+
+def test_grounded_gate_rejects_unsupported_invented_answer(tmp_path):
+    # Negative regression: a fabricated answer with no grounded tokens
+    # in the recall must still be rejected. The gate must not weaken into
+    # "accept any answer" when citation stripping is enabled.
+    ms = MemoryServer(str(tmp_path), "grounded_gate_invented")
+    recall = _make_recall_with_facts(
+        "John signed with the Minnesota Wolves on 2023-05-21.",
+    )
+    # Invented answer with completely different content.
+    answer = "John signed with the Atlantis Octopuses on 21 May 2023."
+    out = ms._normalize_grounded_answer("What team did John sign with?", answer, recall)
+    # Octopuses/Atlantis are not in the recall — gate must NM.
+    assert out == "Not mentioned in the provided context."
+
+
+def test_grounded_gate_preserves_explicit_not_mentioned(tmp_path):
+    # Negative regression: explicit "Not mentioned" with no grounded
+    # candidate must remain "Not mentioned" — fix must not flip negative
+    # answers into positive.
+    ms = MemoryServer(str(tmp_path), "grounded_gate_explicit_nm")
+    recall = _make_recall_with_facts(
+        "John signed with the Minnesota Wolves on 2023-05-21.",
+    )
+    # Note: the question is unrelated to the recall (no Mary in it).
+    answer = "Not mentioned. The retrieved facts do not specify Mary's role."
+    out = ms._normalize_grounded_answer("What is Mary's role?", answer, recall)
+    assert out == "Not mentioned in the provided context."

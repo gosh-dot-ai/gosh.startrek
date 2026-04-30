@@ -559,7 +559,7 @@ def test_tool_payload_has_visible_continuation_instruction_with_answer_contract(
 
     assert "RECALL CONTINUATION AVAILABLE:" in payload_text
     assert 'page="next"' in payload_text
-    assert "without session_id" in payload_text
+    assert "recall_continuation handle" in payload_text
     assert any((tool.get("function") or {}).get("name") == "get_more_context" for tool in plan["payload"]["tools"])
     assert plan["payload_meta"]["use_tool"] is True
 

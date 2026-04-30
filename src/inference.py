@@ -80,16 +80,22 @@ COUNTING_TOOLS = [
 GET_CONTEXT_TOOL = {
     "name": "get_more_context",
     "description": (
-        "Retrieve full raw text of a specific session, or the next recall evidence page. "
+        "Retrieve the next family-agnostic recall evidence page from an opaque handle, "
+        "or full raw text of a specific session. "
         "Use ONLY if facts and raw context don't contain enough detail. "
-        "If recall says more evidence is available, call without session_id or with page=\"next\"."
+        "If recall says more evidence is available, call with handle=<recall_continuation.handle> "
+        "and page=\"next\"."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
+            "handle": {
+                "type": "string",
+                "description": "Opaque recall_continuation.handle returned by memory_recall.",
+            },
             "session_id": {
                 "type": "integer",
-                "description": "Session number (e.g. 12 for S12). Omit to request recall continuation.",
+                "description": "Legacy session number (e.g. 12 for S12). Omit when using handle.",
             },
             "page": {
                 "type": ["integer", "string"],
@@ -97,7 +103,7 @@ GET_CONTEXT_TOOL = {
             },
             "continuation_handle": {
                 "type": "string",
-                "description": "Opaque handle from memory_recall.recall_continuation when provided.",
+                "description": "Legacy alias for handle.",
             },
         },
         "required": []
@@ -109,6 +115,7 @@ def get_more_context(
     session_id: int | None = None,
     raw_sessions: list = None,
     page: int | str | None = None,
+    handle: str | None = None,
     continuation_handle: str | None = None,
     recall_continuation_pages: list | None = None,
     recall_continuation_handle: str | None = None,
@@ -117,20 +124,82 @@ def get_more_context(
     """Return full text of a session or a recall continuation page."""
     if raw_sessions is None:
         raw_sessions = []
+
+    def _raw_session_content_for_entry(entry: dict) -> str:
+        message_id = str(entry.get("message_id") or "").strip()
+        session_num = entry.get("session_num")
+        for raw in raw_sessions:
+            if not isinstance(raw, dict):
+                continue
+            if message_id and str(raw.get("message_id") or "").strip() == message_id:
+                return str(raw.get("content") or raw.get("raw_original") or "").strip()
+            if session_num not in (None, "") and str(raw.get("session_num") or "") == str(session_num):
+                return str(raw.get("content") or raw.get("raw_original") or "").strip()
+        return ""
+
+    def _render_typed_entries(entries: list[dict], page_num: int) -> str:
+        sections = [f"RECALL CONTINUATION PAGE {page_num}:"]
+        raw_lines: list[str] = []
+        code_fact_lines: list[str] = []
+        fact_lines: list[str] = []
+        for entry in entries:
+            entry_type = str(entry.get("type") or "")
+            if entry_type in {"conversation_raw", "document_raw"}:
+                content = _raw_session_content_for_entry(entry)
+                if content:
+                    family = str(entry.get("family") or "raw")
+                    raw_lines.append(f"[{family}] {content}")
+                elif entry.get("fact"):
+                    fact_lines.append(f"- {entry.get('fact')}")
+                continue
+            if entry_type in {"codebase_source", "codebase_fact"}:
+                fact_text = str(entry.get("fact") or "").strip()
+                refs = []
+                if entry.get("file_path"):
+                    refs.append(f"file={entry.get('file_path')}")
+                if entry.get("line_span"):
+                    span = entry.get("line_span") or {}
+                    refs.append(f"lines=L{span.get('start_line')}-{span.get('end_line')}")
+                if entry.get("render_ref_id"):
+                    refs.append(f"render_ref_id={entry.get('render_ref_id')}")
+                ref_text = f" refs: {', '.join(refs)}" if refs else ""
+                code_fact_lines.append(f"- {fact_text}{ref_text}".rstrip())
+                continue
+            if entry.get("fact"):
+                fact_lines.append(f"- {entry.get('fact')}")
+        if fact_lines:
+            sections.append("RETRIEVED FACTS:\n" + "\n".join(fact_lines))
+        if raw_lines:
+            sections.append("COMPLETED RAW EVIDENCE:\n" + "\n".join(raw_lines))
+        if code_fact_lines:
+            sections.append("CODEBASE FACTS:\n" + "\n".join(code_fact_lines))
+        return "\n\n".join(sections)
+
     continuation_requested = (
         session_id in (None, "")
         or page not in (None, "")
+        or bool(handle)
         or bool(continuation_handle)
         or bool(recall_continuation_pages)
     )
     if continuation_requested and session_id in (None, "", 0):
         pages = recall_continuation_pages or []
         expected_handle = str(recall_continuation_handle or "").strip()
-        provided_handle = str(continuation_handle or "").strip()
+        provided_handle = str(handle or continuation_handle or "").strip()
         if provided_handle and expected_handle and provided_handle != expected_handle:
-            return {"result": "Recall continuation handle not found.", "exhausted": True}
+            return {
+                "error": "Recall continuation handle not found.",
+                "code": "RECALL_CONTINUATION_NOT_FOUND",
+                "result": "Recall continuation handle not found.",
+                "exhausted": True,
+            }
         if not pages:
-            return {"result": "No recall continuation is available.", "exhausted": True}
+            return {
+                "error": "No recall continuation is available.",
+                "code": "RECALL_CONTINUATION_NOT_FOUND",
+                "result": "No recall continuation is available.",
+                "exhausted": True,
+            }
         if (isinstance(page, str) and page.strip().lower() == "next") or page in (None, ""):
             page_num = int((continuation_state or {}).get("next_page") or 2)
         elif isinstance(page, int):
@@ -149,18 +218,35 @@ def get_more_context(
                 break
         if selected is None:
             return {
+                "error": "Recall continuation exhausted.",
+                "code": "RECALL_CONTINUATION_EXHAUSTED",
                 "result": "Recall continuation exhausted.",
                 "page": page_num,
                 "exhausted": True,
             }
         if continuation_state is not None:
             continuation_state["next_page"] = page_num + 1
+        selected_context = str(selected.get("context") or "")
+        if not selected_context and isinstance(selected.get("typed_entries"), list):
+            selected_context = _render_typed_entries(list(selected.get("typed_entries") or []), page_num)
         return {
-            "result": str(selected.get("context") or ""),
+            "result": selected_context,
             "page": page_num,
             "next_page": selected.get("next_page"),
             "exhausted": bool(selected.get("exhausted")),
             "continuation_handle": expected_handle or provided_handle or None,
+            "handle": expected_handle or provided_handle or None,
+            "runtime_trace": {
+                "recall_continuation_trace": {
+                    "handle_version": selected.get("handle_version"),
+                    "page_requested": page,
+                    "entries_rendered": selected.get("returned_count"),
+                    "next_index": selected.get("next_page"),
+                    "has_more": not bool(selected.get("exhausted")),
+                    "typed_entry_counts": selected.get("typed_entry_counts", {}),
+                    "render_failures": [],
+                }
+            },
         }
     resolved_session_id = int(session_id) if session_id is not None else 0
     if 0 < resolved_session_id <= len(raw_sessions):
