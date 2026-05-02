@@ -86,27 +86,7 @@ PROFILE_CONFIGS = {
 }
 
 LOCAL_CLI_PROFILE_CONFIGS = {
-    "fast": {
-        "backend": "local_cli",
-        "model": "local/my-cli",
-        "cli_bin": "/abs/path/to/my-cli",
-        "cli_args_prefix": ["run"],
-        "context_window": 200000,
-        "max_output_tokens": 4096,
-        "temperature": 0,
-    }
-}
-
-LOCAL_CLI_PROFILE_CONFIGS = {
-    "fast": {
-        "backend": "local_cli",
-        "model": "local/my-cli",
-        "cli_bin": "/abs/path/to/my-cli",
-        "cli_args_prefix": ["run"],
-        "context_window": 200000,
-        "max_output_tokens": 4096,
-        "temperature": 0,
-    }
+    "fast": {"backend": "local_cli"}
 }
 
 
@@ -1561,16 +1541,7 @@ class TestProfileHelpers:
 
 
 class TestAskLocalCli:
-    def test_ask_with_local_cli_profile_uses_local_cli_backend(self, tmp_path, monkeypatch):
-        captured = {}
-
-        def _fake_run_local_cli(prompt, cli_bin, cli_args_prefix):
-            captured["prompt"] = prompt
-            captured["cli_bin"] = cli_bin
-            captured["cli_args_prefix"] = cli_args_prefix
-            return "local cli answer"
-
-        monkeypatch.setattr("src.memory.run_local_cli", _fake_run_local_cli)
+    def test_ask_with_local_cli_profile_is_agent_executed_only(self, tmp_path):
         ms = MemoryServer(
             str(tmp_path),
             "ask_local_cli",
@@ -1579,17 +1550,10 @@ class TestAskLocalCli:
         )
         _patch_recall(ms, recommended_profile="fast", prompt_type="lookup")
 
-        result = asyncio.run(ms.ask("What happened?"))
+        with pytest.raises(RuntimeError, match="local_cli backend is agent-executed"):
+            asyncio.run(ms.ask("What happened?"))
 
-        assert result["answer"] == "local cli answer"
-        assert result["payload_meta"]["backend"] == "local_cli"
-        assert captured["cli_bin"] == "/abs/path/to/my-cli"
-        assert captured["cli_args_prefix"] == ["run"]
-        assert captured["prompt"].startswith("SYSTEM:\n")
-        assert "What happened?" in captured["prompt"]
-
-    def test_local_cli_backend_rejects_tool_use_explicitly(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("src.memory.run_local_cli", lambda *args, **kwargs: "unused")
+    def test_local_cli_backend_rejects_tool_use_explicitly(self, tmp_path):
         ms = MemoryServer(
             str(tmp_path),
             "ask_local_cli_tool",
@@ -1601,16 +1565,7 @@ class TestAskLocalCli:
         with pytest.raises(RuntimeError, match="local_cli backend does not support tool use"):
             asyncio.run(ms.ask("What happened?", use_tool=True))
 
-    def test_local_cli_backend_does_not_trip_api_shell_budget_gate(self, tmp_path, monkeypatch):
-        captured = {}
-
-        def _fake_run_local_cli(prompt, cli_bin, cli_args_prefix):
-            captured["prompt"] = prompt
-            captured["cli_bin"] = cli_bin
-            captured["cli_args_prefix"] = cli_args_prefix
-            return "local cli answer"
-
-        monkeypatch.setattr("src.memory.run_local_cli", _fake_run_local_cli)
+    def test_local_cli_backend_does_not_trip_api_shell_budget_gate(self, tmp_path):
         ms = MemoryServer(
             str(tmp_path),
             "ask_local_cli_budget",
@@ -1619,10 +1574,5 @@ class TestAskLocalCli:
         )
         _patch_recall(ms, recommended_profile="fast", prompt_type="lookup")
 
-        result = asyncio.run(ms.ask("What happened?", shell_budget=0.000001))
-
-        assert result["answer"] == "local cli answer"
-        assert result["budget_exceeded"] is False
-        assert result["estimated_cost"] == 0.0
-        assert result["payload_meta"]["backend"] == "local_cli"
-        assert captured["cli_bin"] == "/abs/path/to/my-cli"
+        with pytest.raises(RuntimeError, match="local_cli backend is agent-executed"):
+            asyncio.run(ms.ask("What happened?", shell_budget=0.000001))

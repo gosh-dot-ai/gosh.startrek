@@ -27,6 +27,7 @@ from src.episode_retrieval import DEFAULT_SELECTION_CONFIG
 from src.episodes import build_episode_lookup
 from src.memory import MemoryServer, build_episode_hybrid_context
 from src.retrieval import BM25Index
+from src.temporal_evidence_candidates import build_temporal_evidence_candidates_trace
 
 
 def _make_corpus():
@@ -78,6 +79,490 @@ def _make_facts():
             "metadata": {"episode_id": "DOC-1_e02", "episode_source_id": "DOC-1"},
         },
     ]
+
+
+def _runtime_trace_for_packet(tmp_path, corpus, facts, packet):
+    server = MemoryServer(str(tmp_path), "runtime_trace_test", extract_model=None)
+    return server._episode_runtime_trace(
+        corpus=corpus,
+        packet=packet,
+        episode_lookup=build_episode_lookup(corpus),
+        resolved_facts=facts,
+    )
+
+
+def test_runtime_trace_temporal_exists_for_episode_late_fusion_path(tmp_path):
+    corpus = _make_corpus()
+    facts = _make_facts()
+    packet = {
+        "context": "RETRIEVED FACTS:\n[1] Route 1 final approved length is 14.3 km.",
+        "question": "What changed on 2026-01-01?",
+        "retrieved_episode_ids": ["DOC-1_e01"],
+        "actual_injected_episode_ids": ["DOC-1_e01"],
+        "fact_episode_ids": ["DOC-1_e01"],
+        "retrieved_fact_ids": ["f_current"],
+        "selection_scores": [{"episode_id": "DOC-1_e01", "score": 1.0}],
+        "selector_config": {"budget": 8000},
+        "query_operator_plan": {"temporal_leaf": {"source": "retrieval_leaf_prompt", "role": "weak_hint"}},
+        "output_constraints": {},
+        "retrieval_families": ["document"],
+        "search_family": "auto",
+        "family_first_pass_trace": {"available_families": ["document"], "retrieval_families": ["document"]},
+        "late_fusion_trace": {"mode": "single_family"},
+        "temporal_trace": {"query_class": "calendar-seeking", "fallback": True},
+        "tuning_snapshot": {},
+    }
+    before = {key: packet.get(key) for key in ("retrieved_episode_ids", "actual_injected_episode_ids", "context")}
+
+    trace = _runtime_trace_for_packet(tmp_path, corpus, facts, packet)
+
+    assert {key: packet.get(key) for key in before} == before
+    temporal = trace["temporal"]
+    assert temporal["trace_version"] == 1
+    assert temporal["path"] == "episode_late_fusion"
+    assert temporal["episode_selection"]["selected_episode_ids"] == ["DOC-1_e01"]
+    assert temporal["episode_selection"]["actual_injected_episode_ids"] == ["DOC-1_e01"]
+    assert temporal["executor"]["used"] is False
+    assert temporal["provenance"]["enabled"] is True
+    assert temporal["evidence_candidates"]["trace_version"] == 1
+    assert temporal["evidence_candidates"]["selected_episode_ids"] == ["DOC-1_e01"]
+
+
+def test_runtime_trace_temporal_parses_human_timestamps_without_fake_dates(tmp_path):
+    corpus = _make_corpus()
+    corpus["documents"][0]["episodes"][0]["source_date"] = "8:56 pm on 20 July, 2023"
+    facts = _make_facts()
+    facts[0]["metadata"]["event_date"] = "8:56 pm on"
+    facts[0]["metadata"]["source_date"] = "1:33 pm on 4 January, 2024"
+    packet = {
+        "context": "RETRIEVED FACTS:\n[1] Route 1 final approved length is 14.3 km.",
+        "retrieved_episode_ids": ["DOC-1_e01"],
+        "actual_injected_episode_ids": ["DOC-1_e01"],
+        "fact_episode_ids": ["DOC-1_e01"],
+        "retrieved_fact_ids": ["f_current"],
+        "selection_scores": [{"episode_id": "DOC-1_e01", "score": 1.0}],
+        "selector_config": {"budget": 8000},
+        "query_operator_plan": {"temporal_leaf": {"source": "retrieval_leaf_prompt", "role": "weak_hint"}},
+        "output_constraints": {},
+        "retrieval_families": ["document"],
+        "search_family": "auto",
+        "family_first_pass_trace": {"available_families": ["document"], "retrieval_families": ["document"]},
+        "late_fusion_trace": {"mode": "single_family"},
+        "temporal_trace": {"query_class": "calendar-seeking", "fallback": True},
+        "tuning_snapshot": {},
+    }
+
+    trace = _runtime_trace_for_packet(tmp_path, corpus, facts, packet)
+
+    rows = trace["temporal"]["provenance"]["date_provenance_by_episode"]
+    row = next(item for item in rows if item["episode_id"] == "DOC-1_e01")
+    assert row["source_date"] == "2023-07-20"
+    assert row["source_date_raw"] == "8:56 pm on 20 July, 2023"
+    assert row["source_date"] != "8:56 pm on"
+    fact_date = row["fact_dates"][0]
+    assert fact_date["event_date"] is None
+    assert fact_date["event_date_raw"] == "8:56 pm on"
+    assert fact_date["source_date"] == "2024-01-04"
+    assert fact_date["source_date_raw"] == "1:33 pm on 4 January, 2024"
+
+
+def test_runtime_trace_temporal_exists_for_calendar_executor_path(tmp_path):
+    corpus = _make_corpus()
+    facts = _make_facts()
+    packet = {
+        "context": "RETRIEVED FACTS:\n[1] Route 1 final approved length is 14.3 km.",
+        "retrieved_episode_ids": ["DOC-1_e01"],
+        "actual_injected_episode_ids": ["DOC-1_e01"],
+        "fact_episode_ids": ["DOC-1_e01"],
+        "retrieved_fact_ids": ["f_current"],
+        "selection_scores": [{"episode_id": "DOC-1_e01", "score": 1_000_000.0}],
+        "selector_config": {"budget": 8000},
+        "query_operator_plan": {"temporal_leaf": {"source": "retrieval_leaf_prompt", "role": "answer_target"}},
+        "output_constraints": {},
+        "retrieval_families": ["document"],
+        "search_family": "auto",
+        "family_first_pass_trace": {"mode": "skipped_by_calendar_executor", "per_family": []},
+        "late_fusion_trace": {"mode": "skipped_by_calendar_executor"},
+        "temporal_trace": {
+            "query_class": "calendar-answer",
+            "matched": True,
+            "fallback": False,
+            "executor_episode_ids": ["DOC-1_e01"],
+            "pinned_episode_ids": ["DOC-1_e01"],
+            "matched_fact_ids": ["f_current"],
+            "matched_event_ids": ["evt_route"],
+        },
+        "tuning_snapshot": {},
+    }
+
+    trace = _runtime_trace_for_packet(tmp_path, corpus, facts, packet)
+    temporal = trace["temporal"]
+
+    assert temporal["trace_version"] == 1
+    assert temporal["path"] == "calendar_executor"
+    assert temporal["coverage"]["calendar_trace_present"] is True
+    assert temporal["executor"]["used"] is True
+    assert temporal["executor"]["type"] == "calendar"
+    assert temporal["executor"]["selected_episode_ids"] == ["DOC-1_e01"]
+    assert temporal["executor"]["pinned_episode_ids"] == ["DOC-1_e01"]
+    assert temporal["provenance"]["enabled"] is True
+
+
+def test_runtime_trace_temporal_minimal_for_non_temporal_query(tmp_path):
+    corpus = _make_corpus()
+    facts = _make_facts()
+    packet = {
+        "context": "RETRIEVED FACTS:\n[1] Route 1 final approved length is 14.3 km.",
+        "retrieved_episode_ids": ["DOC-1_e01"],
+        "actual_injected_episode_ids": ["DOC-1_e01"],
+        "fact_episode_ids": ["DOC-1_e01"],
+        "retrieved_fact_ids": ["f_current"],
+        "selection_scores": [{"episode_id": "DOC-1_e01", "score": 1.0}],
+        "selector_config": {"budget": 8000},
+        "query_operator_plan": {},
+        "output_constraints": {},
+        "retrieval_families": ["document"],
+        "search_family": "auto",
+        "family_first_pass_trace": {"available_families": ["document"], "retrieval_families": ["document"]},
+        "late_fusion_trace": {"mode": "single_family"},
+        "temporal_trace": None,
+        "tuning_snapshot": {},
+    }
+
+    trace = _runtime_trace_for_packet(tmp_path, corpus, facts, packet)
+    temporal = trace["temporal"]
+
+    assert temporal["trace_version"] == 1
+    assert temporal["path"] == "none"
+    assert temporal["provenance"]["enabled"] is False
+    assert temporal["coverage"]["missing_reason"] == "non_temporal_query"
+    assert "evidence_candidates" not in temporal
+
+
+def _candidate_fixture():
+    episode_lookup = {
+        "SRC_e01": {
+            "episode_id": "SRC_e01",
+            "source_id": "SRC",
+            "source_type": "conversation",
+            "source_date": "2026-02-03",
+            "raw_text": "The auth service modified login.py during the maintenance window.",
+        },
+        "SRC_e02": {
+            "episode_id": "SRC_e02",
+            "source_id": "SRC",
+            "source_type": "conversation",
+            "source_date": "2026-02-03",
+            "raw_text": "The team attended a general planning meeting.",
+        },
+        "SRC_e03": {
+            "episode_id": "SRC_e03",
+            "source_id": "SRC",
+            "source_type": "conversation",
+            "source_date": "2026-04-11",
+            "raw_text": "The auth service rotated certificates in April.",
+        },
+    }
+    facts_by_episode = {
+        "SRC_e01": [
+            {
+                "id": "f_login",
+                "fact": "auth service modified login.py on 2026-02-03.",
+                "metadata": {"episode_id": "SRC_e01", "event_date": "2026-02-03"},
+            }
+        ],
+        "SRC_e02": [
+            {
+                "id": "f_meeting",
+                "fact": "The team attended a meeting on 2026-02-03.",
+                "metadata": {"episode_id": "SRC_e02", "event_date": "2026-02-03"},
+            }
+        ],
+        "SRC_e03": [
+            {
+                "id": "f_certs",
+                "fact": "auth service rotated certificates in April 2026.",
+                "metadata": {"episode_id": "SRC_e03", "event_date": "2026-04-11"},
+            }
+        ],
+    }
+    temporal_index = {
+        "events": {
+            "evt_login": {
+                "event_id": "evt_login",
+                "time_start": "2026-02-03",
+                "time_end": "2026-02-03",
+                "support_fact_ids": ["f_login"],
+                "payload": {"episode_id": "SRC_e01"},
+            },
+            "evt_meeting": {
+                "event_id": "evt_meeting",
+                "time_start": "2026-02-03",
+                "time_end": "2026-02-03",
+                "support_fact_ids": ["f_meeting"],
+                "payload": {"episode_id": "SRC_e02"},
+            },
+            "evt_certs": {
+                "event_id": "evt_certs",
+                "time_start": "2026-04-11",
+                "time_end": "2026-04-11",
+                "support_fact_ids": ["f_certs"],
+                "payload": {"episode_id": "SRC_e03"},
+            },
+        }
+    }
+    return episode_lookup, facts_by_episode, temporal_index
+
+
+def test_temporal_evidence_candidates_direct_lookup_traces_weak_date_match():
+    episode_lookup, facts_by_episode, temporal_index = _candidate_fixture()
+    packet = {
+        "question": "Which file did auth service modify on 2026-02-03?",
+        "retrieved_episode_ids": ["SRC_e01"],
+        "actual_injected_episode_ids": ["SRC_e01"],
+        "fact_episode_ids": ["SRC_e01"],
+    }
+
+    trace = build_temporal_evidence_candidates_trace(
+        question=packet["question"],
+        packet=packet,
+        episode_lookup=episode_lookup,
+        facts_by_episode=facts_by_episode,
+        temporal_index=temporal_index,
+    )
+
+    assert trace["operator_class"] == "direct_lookup"
+    rows = {row["episode_id"]: row for row in trace["candidates"]}
+    assert rows["SRC_e01"]["selection_status"] == "already_selected"
+    assert rows["SRC_e01"]["content_support"]["answer_object_support"] == "present"
+    assert rows["SRC_e02"]["selection_status"] == "date_match_content_weak"
+    assert rows["SRC_e02"]["reason"] == "date_match_but_content_support_weak"
+    assert "SRC_e02" in trace["omitted_date_matching_episode_ids"]
+
+
+def test_temporal_evidence_candidates_month_lookup_traces_selected_and_omitted():
+    episode_lookup, facts_by_episode, temporal_index = _candidate_fixture()
+    episode_lookup["SRC_e04"] = {
+        "episode_id": "SRC_e04",
+        "source_id": "SRC",
+        "source_type": "conversation",
+        "source_date": "2026-04-23",
+        "raw_text": "The auth service patched dependencies in April.",
+    }
+    facts_by_episode["SRC_e04"] = [
+        {
+            "id": "f_deps",
+            "fact": "auth service patched dependencies on 2026-04-23.",
+            "metadata": {"episode_id": "SRC_e04", "event_date": "2026-04-23"},
+        }
+    ]
+    temporal_index["events"]["evt_deps"] = {
+        "event_id": "evt_deps",
+        "time_start": "2026-04-23",
+        "time_end": "2026-04-23",
+        "support_fact_ids": ["f_deps"],
+        "payload": {"episode_id": "SRC_e04"},
+    }
+    packet = {
+        "question": "Which maintenance tasks did auth service perform in April 2026?",
+        "retrieved_episode_ids": ["SRC_e03"],
+        "actual_injected_episode_ids": ["SRC_e03"],
+        "fact_episode_ids": ["SRC_e03"],
+    }
+
+    trace = build_temporal_evidence_candidates_trace(
+        question=packet["question"],
+        packet=packet,
+        episode_lookup=episode_lookup,
+        facts_by_episode=facts_by_episode,
+        temporal_index=temporal_index,
+    )
+
+    assert trace["operator_class"] == "month_year_lookup"
+    assert trace["query_range"]["start"] == "2026-04-01"
+    assert trace["query_range"]["end"] == "2026-04-30"
+    assert "SRC_e04" in trace["omitted_date_matching_episode_ids"]
+    assert {row["episode_id"] for row in trace["candidates"]} >= {"SRC_e03", "SRC_e04"}
+
+
+def test_temporal_evidence_candidates_count_interval_warns_when_incomplete():
+    episode_lookup, facts_by_episode, temporal_index = _candidate_fixture()
+    packet = {
+        "question": "How many audits did auth service run in 2026?",
+        "retrieved_episode_ids": ["SRC_e01"],
+        "actual_injected_episode_ids": ["SRC_e01"],
+        "fact_episode_ids": ["SRC_e01"],
+    }
+
+    trace = build_temporal_evidence_candidates_trace(
+        question=packet["question"],
+        packet=packet,
+        episode_lookup=episode_lookup,
+        facts_by_episode=facts_by_episode,
+        temporal_index=temporal_index,
+    )
+
+    assert trace["operator_class"] == "count_completeness"
+    assert trace["candidate_count"] > len(trace["selected_episode_ids"])
+    assert "temporal_candidate_pool_exceeds_selected_context" in trace["warnings"]
+
+
+def test_temporal_evidence_candidates_as_of_marks_post_cutoff():
+    episode_lookup, facts_by_episode, temporal_index = _candidate_fixture()
+    episode_lookup["SRC_e05"] = {
+        "episode_id": "SRC_e05",
+        "source_id": "SRC",
+        "source_type": "conversation",
+        "source_date": "2026-05-02",
+        "raw_text": "The auth service changed status after the cutoff.",
+    }
+    facts_by_episode["SRC_e05"] = [
+        {
+            "id": "f_after",
+            "fact": "auth service changed status on 2026-05-02.",
+            "metadata": {"episode_id": "SRC_e05", "event_date": "2026-05-02"},
+        }
+    ]
+    temporal_index["events"]["evt_after"] = {
+        "event_id": "evt_after",
+        "time_start": "2026-05-02",
+        "time_end": "2026-05-02",
+        "support_fact_ids": ["f_after"],
+        "payload": {"episode_id": "SRC_e05"},
+    }
+    packet = {
+        "question": "What was auth service status as of 2026-05-01?",
+        "retrieved_episode_ids": ["SRC_e01"],
+        "actual_injected_episode_ids": ["SRC_e01"],
+        "fact_episode_ids": ["SRC_e01"],
+    }
+
+    trace = build_temporal_evidence_candidates_trace(
+        question=packet["question"],
+        packet=packet,
+        episode_lookup=episode_lookup,
+        facts_by_episode=facts_by_episode,
+        temporal_index=temporal_index,
+    )
+
+    rows = {row["episode_id"]: row for row in trace["candidates"]}
+    assert trace["operator_class"] == "as_of_state"
+    assert rows["SRC_e05"]["date_relation"] == "post_cutoff"
+    assert rows["SRC_e05"]["selection_status"] == "post_cutoff"
+
+
+def test_temporal_evidence_candidates_source_date_fallback_is_not_event_date():
+    episode_lookup = {
+        "SRC_e10": {
+            "episode_id": "SRC_e10",
+            "source_id": "SRC",
+            "source_type": "conversation",
+            "source_date": "2026-06-01",
+            "raw_text": "The build service restarted.",
+        }
+    }
+    facts_by_episode = {
+        "SRC_e10": [
+            {
+                "id": "f_restart",
+                "fact": "build service restarted.",
+                "metadata": {
+                    "episode_id": "SRC_e10",
+                    "source_date_fallback": "2026-06-01",
+                    "event_date_provenance": "source_date_fallback",
+                },
+            }
+        ]
+    }
+    packet = {
+        "question": "What did build service do on 2026-06-01?",
+        "retrieved_episode_ids": ["SRC_e10"],
+        "actual_injected_episode_ids": ["SRC_e10"],
+        "fact_episode_ids": ["SRC_e10"],
+    }
+
+    trace = build_temporal_evidence_candidates_trace(
+        question=packet["question"],
+        packet=packet,
+        episode_lookup=episode_lookup,
+        facts_by_episode=facts_by_episode,
+        temporal_index={"events": {}},
+    )
+
+    row = trace["candidates"][0]
+    assert row["event_date"] is None
+    assert row["source_date"] == "2026-06-01"
+    assert row["date_provenance"] == "source_date_fallback"
+
+
+def test_temporal_evidence_candidates_uses_index_event_date_for_omitted_candidate_without_fact_row():
+    episode_lookup, facts_by_episode, temporal_index = _candidate_fixture()
+    facts_by_episode.pop("SRC_e02")
+    packet = {
+        "question": "Which file did auth service modify on 2026-02-03?",
+        "retrieved_episode_ids": ["SRC_e01"],
+        "actual_injected_episode_ids": ["SRC_e01"],
+        "fact_episode_ids": ["SRC_e01"],
+    }
+
+    trace = build_temporal_evidence_candidates_trace(
+        question=packet["question"],
+        packet=packet,
+        episode_lookup=episode_lookup,
+        facts_by_episode=facts_by_episode,
+        temporal_index=temporal_index,
+    )
+
+    rows = {row["episode_id"]: row for row in trace["candidates"]}
+    assert rows["SRC_e02"]["event_date"] == "2026-02-03"
+    assert rows["SRC_e02"]["date_provenance"] == "event_date"
+    assert rows["SRC_e02"]["date_relation"] == "inside_range"
+    assert rows["SRC_e02"]["fact_ids"] == ["f_meeting"]
+
+
+def test_temporal_evidence_candidates_does_not_trace_events_outside_episode_lookup():
+    episode_lookup, facts_by_episode, temporal_index = _candidate_fixture()
+    temporal_index["events"]["evt_hidden"] = {
+        "event_id": "evt_hidden",
+        "time_start": "2026-02-03",
+        "time_end": "2026-02-03",
+        "support_fact_ids": ["f_hidden"],
+        "payload": {"episode_id": "HIDDEN_e99"},
+    }
+    packet = {
+        "question": "Which file did auth service modify on 2026-02-03?",
+        "retrieved_episode_ids": ["SRC_e01"],
+        "actual_injected_episode_ids": ["SRC_e01"],
+        "fact_episode_ids": ["SRC_e01"],
+    }
+
+    trace = build_temporal_evidence_candidates_trace(
+        question=packet["question"],
+        packet=packet,
+        episode_lookup=episode_lookup,
+        facts_by_episode=facts_by_episode,
+        temporal_index=temporal_index,
+    )
+
+    episode_ids = {row["episode_id"] for row in trace["candidates"]}
+    assert "HIDDEN_e99" not in episode_ids
+
+
+def test_temporal_evidence_candidates_non_temporal_query_returns_none():
+    episode_lookup, facts_by_episode, temporal_index = _candidate_fixture()
+    trace = build_temporal_evidence_candidates_trace(
+        question="What is the approved route length?",
+        packet={
+            "retrieved_episode_ids": ["SRC_e01"],
+            "actual_injected_episode_ids": ["SRC_e01"],
+            "fact_episode_ids": ["SRC_e01"],
+        },
+        episode_lookup=episode_lookup,
+        facts_by_episode=facts_by_episode,
+        temporal_index=temporal_index,
+    )
+
+    assert trace is None
 
 
 def test_build_context_from_selected_episodes_surfaces_list_evidence_from_same_source_for_indoor_queries():

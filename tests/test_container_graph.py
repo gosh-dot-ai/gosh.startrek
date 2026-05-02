@@ -154,6 +154,29 @@ def _terminal_render_candidate(**overrides) -> dict:
     return candidate
 
 
+def _exact_copy_profiles(model: str = "gpt-4o-mini") -> tuple[dict[int, str], dict[str, dict]]:
+    return {
+        1: "fast",
+    }, {
+        "fast": {
+            "backend": "api",
+            "model": model,
+            "max_output_tokens": 2000,
+            "context_window": 128000,
+            "temperature": 0,
+        }
+    }
+
+
+def _set_fake_send_payload(ms: MemoryServer, answer: str, assert_payload=None) -> None:
+    async def _fake_send_payload(payload, **_kwargs):
+        if assert_payload is not None:
+            assert_payload(payload)
+        return answer, False, []
+
+    ms._send_payload = _fake_send_payload  # type: ignore[method-assign]
+
+
 def test_container_stable_hash_is_deterministic():
     assert stable_hash("container", {"b": 2, "a": 1}) == stable_hash("container", {"a": 1, "b": 2})
 
@@ -928,19 +951,8 @@ async def test_container_executor_uses_order_scope_ids_as_scopes_not_sources():
     assert packet["terminal_render_candidate"]["render_ref_id"]
 
 
-def test_local_cli_container_exact_copy_decision_returns_terminal_exact_answer(tmp_path, monkeypatch):
-    profiles = {1: "fast"}
-    profile_configs = {
-        "fast": {
-            "backend": "local_cli",
-            "model": "fake-model",
-            "cli_bin": "fake-cli",
-            "cli_args_prefix": [],
-            "max_output_tokens": 2000,
-            "context_window": 128000,
-            "temperature": 0,
-        }
-    }
+def test_exact_copy_decision_returns_terminal_exact_answer(tmp_path):
+    profiles, profile_configs = _exact_copy_profiles()
     ms = MemoryServer(
         str(tmp_path),
         "container_exact_copy_ask",
@@ -980,14 +992,18 @@ def test_local_cli_container_exact_copy_decision_returns_terminal_exact_answer(t
             "runtime_trace": {"container_graph": {"render_mode": "exact_copy", "exact_copy_validated": True}},
         }
 
-    def _fake_run_local_cli(prompt, cli_bin, cli_args_prefix):
-        assert "TERMINAL RENDER CANDIDATE" in prompt
-        assert "leading spaces stay" not in prompt
-        assert cli_bin == "fake-cli"
-        return '{"decision":"use_candidate","candidate_id":"candidate-edge"}'
+    def _assert_payload(prompt_payload):
+        serialized_payload = json.dumps(prompt_payload, ensure_ascii=False)
+        assert "TERMINAL RENDER CANDIDATE" in serialized_payload
+        assert "leading spaces stay" not in serialized_payload
+        assert prompt_payload["model"] == "gpt-4o-mini"
 
     ms.recall = _fake_recall  # type: ignore[method-assign]
-    monkeypatch.setattr("src.memory.run_local_cli", _fake_run_local_cli)
+    _set_fake_send_payload(
+        ms,
+        '{"decision":"use_candidate","candidate_id":"candidate-edge"}',
+        assert_payload=_assert_payload,
+    )
 
     result = asyncio.run(ms.ask("copy the first artifact exactly", use_tool=True))
 
@@ -1007,18 +1023,7 @@ def test_local_cli_container_exact_copy_decision_returns_terminal_exact_answer(t
 
 
 def test_exact_copy_ask_calls_model_before_internal_terminal_render_and_hides_raw(tmp_path):
-    profiles = {1: "fast"}
-    profile_configs = {
-        "fast": {
-            "backend": "local_cli",
-            "model": "fake-model",
-            "cli_bin": "fake-cli",
-            "cli_args_prefix": [],
-            "max_output_tokens": 2000,
-            "context_window": 128000,
-            "temperature": 0,
-        }
-    }
+    profiles, profile_configs = _exact_copy_profiles()
     ms = MemoryServer(
         str(tmp_path),
         "container_exact_copy_model_gate",
@@ -1087,19 +1092,8 @@ def test_exact_copy_ask_calls_model_before_internal_terminal_render_and_hides_ra
     assert result["render_results"][0]["terminal_render_answer"] is True
 
 
-def test_local_cli_container_exact_copy_refusal_does_not_prefix(tmp_path, monkeypatch):
-    profiles = {1: "fast"}
-    profile_configs = {
-        "fast": {
-            "backend": "local_cli",
-            "model": "fake-model",
-            "cli_bin": "fake-cli",
-            "cli_args_prefix": [],
-            "max_output_tokens": 2000,
-            "context_window": 128000,
-            "temperature": 0,
-        }
-    }
+def test_exact_copy_refusal_does_not_prefix(tmp_path):
+    profiles, profile_configs = _exact_copy_profiles()
     ms = MemoryServer(
         str(tmp_path),
         "container_exact_copy_refusal",
@@ -1131,11 +1125,11 @@ def test_local_cli_container_exact_copy_refusal_does_not_prefix(tmp_path, monkey
             "runtime_trace": {"container_graph": {"render_mode": "exact_copy", "exact_copy_validated": True}},
         }
 
-    def _fake_run_local_cli(_prompt, _cli_bin, _cli_args_prefix):
-        return "The model tried to answer without selecting the terminal render candidate."
-
     ms.recall = _fake_recall  # type: ignore[method-assign]
-    monkeypatch.setattr("src.memory.run_local_cli", _fake_run_local_cli)
+    _set_fake_send_payload(
+        ms,
+        "The model tried to answer without selecting the terminal render candidate.",
+    )
 
     result = asyncio.run(ms.ask("copy the first artifact exactly"))
 
@@ -1185,19 +1179,8 @@ def test_exact_copy_proof_requires_explicit_true_for_required_fields(tmp_path, f
         ("selected raw body\n", "EXACT_COPY_MODEL_DID_NOT_SELECT_CANDIDATE"),
     ],
 )
-def test_exact_copy_rejects_wrong_handle_or_copied_text(tmp_path, monkeypatch, model_answer, expected_error):
-    profiles = {1: "fast"}
-    profile_configs = {
-        "fast": {
-            "backend": "local_cli",
-            "model": "fake-model",
-            "cli_bin": "fake-cli",
-            "cli_args_prefix": [],
-            "max_output_tokens": 2000,
-            "context_window": 128000,
-            "temperature": 0,
-        }
-    }
+def test_exact_copy_rejects_wrong_handle_or_copied_text(tmp_path, model_answer, expected_error):
+    profiles, profile_configs = _exact_copy_profiles()
     ms = MemoryServer(
         str(tmp_path),
         "container_exact_copy_bad_handle",
@@ -1221,12 +1204,11 @@ def test_exact_copy_rejects_wrong_handle_or_copied_text(tmp_path, monkeypatch, m
             "runtime_trace": {"terminal_render_candidate": {"candidate_id": "candidate-refusal"}},
         }
 
-    def _fake_run_local_cli(prompt, _cli_bin, _cli_args_prefix):
-        assert "selected raw body" not in prompt
-        return model_answer
+    def _assert_payload(prompt_payload):
+        assert "selected raw body" not in json.dumps(prompt_payload, ensure_ascii=False)
 
     ms.recall = _fake_recall  # type: ignore[method-assign]
-    monkeypatch.setattr("src.memory.run_local_cli", _fake_run_local_cli)
+    _set_fake_send_payload(ms, model_answer, assert_payload=_assert_payload)
 
     result = asyncio.run(ms.ask("copy the first artifact exactly"))
 
@@ -1235,19 +1217,8 @@ def test_exact_copy_rejects_wrong_handle_or_copied_text(tmp_path, monkeypatch, m
     assert result["terminal_render_trace"]["error"] == expected_error
 
 
-def test_local_cli_container_exact_copy_rejects_incomplete_decision(tmp_path, monkeypatch):
-    profiles = {1: "fast"}
-    profile_configs = {
-        "fast": {
-            "backend": "local_cli",
-            "model": "fake-model",
-            "cli_bin": "fake-cli",
-            "cli_args_prefix": [],
-            "max_output_tokens": 2000,
-            "context_window": 128000,
-            "temperature": 0,
-        }
-    }
+def test_exact_copy_rejects_incomplete_decision(tmp_path):
+    profiles, profile_configs = _exact_copy_profiles()
     ms = MemoryServer(
         str(tmp_path),
         "container_exact_copy_bad_decision",
@@ -1274,11 +1245,8 @@ def test_local_cli_container_exact_copy_rejects_incomplete_decision(tmp_path, mo
             "runtime_trace": {"container_graph": {"render_mode": "exact_copy", "exact_copy_validated": True}},
         }
 
-    def _fake_run_local_cli(_prompt, _cli_bin, _cli_args_prefix):
-        return '{"candidate_id":"candidate-refusal"}'
-
     ms.recall = _fake_recall  # type: ignore[method-assign]
-    monkeypatch.setattr("src.memory.run_local_cli", _fake_run_local_cli)
+    _set_fake_send_payload(ms, '{"candidate_id":"candidate-refusal"}')
 
     result = asyncio.run(ms.ask("copy the first artifact exactly"))
 
@@ -1288,19 +1256,8 @@ def test_local_cli_container_exact_copy_rejects_incomplete_decision(tmp_path, mo
     assert result["terminal_render_trace"]["error"] == "EXACT_COPY_MODEL_DID_NOT_SELECT_CANDIDATE"
 
 
-def test_local_cli_container_exact_copy_preserves_literal_think_tags(tmp_path, monkeypatch):
-    profiles = {1: "fast"}
-    profile_configs = {
-        "fast": {
-            "backend": "local_cli",
-            "model": "fake-model",
-            "cli_bin": "fake-cli",
-            "cli_args_prefix": [],
-            "max_output_tokens": 2000,
-            "context_window": 128000,
-            "temperature": 0,
-        }
-    }
+def test_exact_copy_preserves_literal_think_tags(tmp_path):
+    profiles, profile_configs = _exact_copy_profiles()
     ms = MemoryServer(
         str(tmp_path),
         "container_exact_copy_prefix_restore",
@@ -1334,11 +1291,8 @@ def test_local_cli_container_exact_copy_preserves_literal_think_tags(tmp_path, m
             "runtime_trace": {"container_graph": {"render_mode": "exact_copy", "exact_copy_validated": True}},
         }
 
-    def _fake_run_local_cli(_prompt, _cli_bin, _cli_args_prefix):
-        return '{"decision":"use_candidate","candidate_id":"candidate-think"}'
-
     ms.recall = _fake_recall  # type: ignore[method-assign]
-    monkeypatch.setattr("src.memory.run_local_cli", _fake_run_local_cli)
+    _set_fake_send_payload(ms, '{"decision":"use_candidate","candidate_id":"candidate-think"}')
 
     result = asyncio.run(ms.ask("copy the first artifact exactly"))
 
@@ -1348,19 +1302,8 @@ def test_local_cli_container_exact_copy_preserves_literal_think_tags(tmp_path, m
 
 
 @pytest.mark.parametrize("family", ["codebase", "conversation"])
-def test_exact_copy_candidate_ask_path_is_family_generic(tmp_path, monkeypatch, family):
-    profiles = {1: "fast"}
-    profile_configs = {
-        "fast": {
-            "backend": "local_cli",
-            "model": "fake-model",
-            "cli_bin": "fake-cli",
-            "cli_args_prefix": [],
-            "max_output_tokens": 2000,
-            "context_window": 128000,
-            "temperature": 0,
-        }
-    }
+def test_exact_copy_candidate_ask_path_is_family_generic(tmp_path, family):
+    profiles, profile_configs = _exact_copy_profiles()
     ms = MemoryServer(
         str(tmp_path),
         f"exact_copy_{family}",
@@ -1397,12 +1340,15 @@ def test_exact_copy_candidate_ask_path_is_family_generic(tmp_path, monkeypatch, 
             "runtime_trace": {"terminal_render_candidate": {"family": family}},
         }
 
-    def _fake_run_local_cli(prompt, _cli_bin, _cli_args_prefix):
-        assert f"{family} exact body" not in prompt
-        return f'{{"decision":"use_candidate","candidate_id":"{family}-candidate"}}'
+    def _assert_payload(prompt_payload):
+        assert f"{family} exact body" not in json.dumps(prompt_payload, ensure_ascii=False)
 
     ms.recall = _fake_recall  # type: ignore[method-assign]
-    monkeypatch.setattr("src.memory.run_local_cli", _fake_run_local_cli)
+    _set_fake_send_payload(
+        ms,
+        f'{{"decision":"use_candidate","candidate_id":"{family}-candidate"}}',
+        assert_payload=_assert_payload,
+    )
 
     result = asyncio.run(ms.ask(f"copy the {family} unit exactly"))
 
@@ -1527,19 +1473,8 @@ async def test_mcp_memory_recall_exposes_terminal_render_candidate_without_raw_t
     assert "render_text" not in result["terminal_render_candidate"]["proof_summary"]
 
 
-def test_local_cli_exact_copy_refuses_when_anchor_missing(tmp_path, monkeypatch):
-    profiles = {1: "fast"}
-    profile_configs = {
-        "fast": {
-            "backend": "local_cli",
-            "model": "fake-model",
-            "cli_bin": "fake-cli",
-            "cli_args_prefix": [],
-            "max_output_tokens": 2000,
-            "context_window": 128000,
-            "temperature": 0,
-        }
-    }
+def test_exact_copy_refuses_when_anchor_missing(tmp_path):
+    profiles, profile_configs = _exact_copy_profiles()
     ms = MemoryServer(
         str(tmp_path),
         "container_exact_copy_anchor_missing",
@@ -1583,13 +1518,13 @@ def test_local_cli_exact_copy_refuses_when_anchor_missing(tmp_path, monkeypatch)
             "runtime_trace": {"terminal_render_candidate": candidate},
         }
 
-    def _fake_run_local_cli(prompt, _cli_bin, _cli_args_prefix):
-        assert "anchor_tokens_missing: ['trainings']" in prompt
-        assert "selected raw body" not in prompt
-        return EXACT_COPY_REFUSAL
+    def _assert_payload(prompt_payload):
+        serialized_payload = json.dumps(prompt_payload, ensure_ascii=False)
+        assert "anchor_tokens_missing: ['trainings']" in serialized_payload
+        assert "selected raw body" not in serialized_payload
 
     ms.recall = _fake_recall  # type: ignore[method-assign]
-    monkeypatch.setattr("src.memory.run_local_cli", _fake_run_local_cli)
+    _set_fake_send_payload(ms, EXACT_COPY_REFUSAL, assert_payload=_assert_payload)
 
     result = asyncio.run(ms.ask("copy the 4th song about trainings exactly"))
 
@@ -1598,19 +1533,8 @@ def test_local_cli_exact_copy_refuses_when_anchor_missing(tmp_path, monkeypatch)
     assert result["terminal_render_trace"]["error"] == "EXACT_COPY_MODEL_DID_NOT_SELECT_CANDIDATE"
 
 
-def test_exact_copy_runtime_refuses_degraded_candidate_even_if_model_selects(tmp_path, monkeypatch):
-    profiles = {1: "fast"}
-    profile_configs = {
-        "fast": {
-            "backend": "local_cli",
-            "model": "fake-model",
-            "cli_bin": "fake-cli",
-            "cli_args_prefix": [],
-            "max_output_tokens": 2000,
-            "context_window": 128000,
-            "temperature": 0,
-        }
-    }
+def test_exact_copy_runtime_refuses_degraded_candidate_even_if_model_selects(tmp_path):
+    profiles, profile_configs = _exact_copy_profiles()
     ms = MemoryServer(
         str(tmp_path),
         "container_exact_copy_degraded_proof",
@@ -1659,12 +1583,15 @@ def test_exact_copy_runtime_refuses_degraded_candidate_even_if_model_selects(tmp
             "runtime_trace": {"terminal_render_candidate": candidate},
         }
 
-    def _fake_run_local_cli(prompt, _cli_bin, _cli_args_prefix):
-        assert "selected raw body" not in prompt
-        return '{"decision":"use_candidate","candidate_id":"candidate-degraded"}'
+    def _assert_payload(prompt_payload):
+        assert "selected raw body" not in json.dumps(prompt_payload, ensure_ascii=False)
 
     ms.recall = _fake_recall  # type: ignore[method-assign]
-    monkeypatch.setattr("src.memory.run_local_cli", _fake_run_local_cli)
+    _set_fake_send_payload(
+        ms,
+        '{"decision":"use_candidate","candidate_id":"candidate-degraded"}',
+        assert_payload=_assert_payload,
+    )
 
     result = asyncio.run(ms.ask("copy exactly"))
 

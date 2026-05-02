@@ -654,12 +654,8 @@ async def test_recall_codebase_local_cli_profile_downgrades_tool_payload(tmp_pat
         {
             "local": {
                 "backend": "local_cli",
-                "model": "fake-local",
-                "cli_bin": "fake-cli",
-                "cli_args_prefix": [],
                 "max_output_tokens": 2000,
                 "context_window": 128000,
-                "temperature": 0,
             }
         },
     )
@@ -1259,12 +1255,8 @@ async def test_recall_codebase_context_survives_profile_payload_truncation(tmp_p
         {
             "fast": {
                 "backend": "local_cli",
-                "model": "local/test-cli",
-                "cli_bin": "/bin/cat",
-                "cli_args_prefix": [],
                 "context_window": 128000,
                 "max_output_tokens": 1024,
-                "temperature": 0,
             }
         },
     )
@@ -1299,21 +1291,13 @@ async def test_repo_patch_context_uses_strong_profile_and_is_not_tier4_evicted(t
         {
             "fast": {
                 "backend": "local_cli",
-                "model": "local/test-cli",
-                "cli_bin": "/bin/cat",
-                "cli_args_prefix": [],
                 "context_window": 600,
                 "max_output_tokens": 128,
-                "temperature": 0,
             },
             "strong": {
                 "backend": "local_cli",
-                "model": "local/test-cli",
-                "cli_bin": "/bin/cat",
-                "cli_args_prefix": [],
                 "context_window": 128000,
                 "max_output_tokens": 1024,
-                "temperature": 0,
             },
         },
     )

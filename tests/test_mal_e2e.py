@@ -374,6 +374,103 @@ class TestMALMCPTools:
         assert listed["count"] == 1
         assert listed["events"][0]["verdict"] == "bad_answer"
 
+    def test_feedback_preserves_temporal_runtime_trace(self, tmp_path, monkeypatch):
+        """MAL stores runtime_trace.temporal without introducing temporal tuning."""
+        import src.mcp_server as mcp_mod
+        from src.mcp_server import (
+            _mal_stores,
+            memory_mal_configure,
+            memory_mal_feedback,
+            memory_mal_list_feedback,
+        )
+
+        _patch_all(monkeypatch)
+        data_dir = str(tmp_path)
+        mcp_mod.data_dir = data_dir
+        mcp_mod.registry.clear()
+        _mal_stores.clear()
+
+        evidence_candidates = {
+            "trace_version": 1,
+            "operator_class": "as_of_state",
+            "query_range": {
+                "start": None,
+                "end": "2026-03-01",
+                "source": "explicit",
+                "confidence": 0.9,
+            },
+            "candidate_count": 1,
+            "selected_episode_ids": ["SRC_e01"],
+            "candidates": [
+                {
+                    "episode_id": "SRC_e01",
+                    "fact_ids": ["f_001"],
+                    "event_date": "2026-02-28",
+                    "source_date": "2026-02-28",
+                    "session_date": None,
+                    "date_provenance": "event_date",
+                    "date_relation": "inside_range",
+                    "content_support": {
+                        "query_token_overlap": 2,
+                        "named_slot_overlap": 0,
+                        "answer_object_support": "present",
+                        "required_terms_missing": [],
+                    },
+                    "selection_status": "already_selected",
+                    "reason": "selected_context_contains_candidate",
+                }
+            ],
+            "omitted_date_matching_episode_ids": [],
+            "warnings": [],
+        }
+        runtime_trace = {
+            "temporal": {
+                "trace_version": 1,
+                "path": "episode_late_fusion",
+                "leaf_decision": {
+                    "source": "retrieval_leaf_prompt",
+                    "execution_policy": "soft_signal",
+                },
+                "executor": {
+                    "used": False,
+                    "type": None,
+                    "selected_episode_ids": [],
+                },
+                "evidence_candidates": evidence_candidates,
+            }
+        }
+
+        asyncio.run(memory_mal_configure(
+            key=KEY,
+            agent_id=AGENT,
+            enabled=True,
+            token=_mcp_token(),
+        ))
+        result = asyncio.run(memory_mal_feedback(
+            key=KEY,
+            agent_id=AGENT,
+            verdict="bad_answer",
+            query="Which event happened in May?",
+            runtime_trace_ref="ask_temporal_trace",
+            runtime_trace=runtime_trace,
+            token=_mcp_token(),
+        ))
+        assert result["status"] == "ok"
+
+        listed = asyncio.run(memory_mal_list_feedback(
+            key=KEY,
+            agent_id=AGENT,
+            token=_mcp_token(),
+        ))
+        event = listed["events"][0]
+        assert event["runtime_trace"]["temporal"]["trace_version"] == 1
+        assert event["runtime_trace"]["temporal"]["path"] == "episode_late_fusion"
+        assert event["runtime_trace"]["temporal"]["leaf_decision"]["execution_policy"] == "soft_signal"
+        assert event["runtime_trace"]["temporal"]["executor"]["used"] is False
+        assert event["runtime_trace"]["temporal"]["evidence_candidates"] == evidence_candidates
+        assert event["runtime_trace"]["temporal"] == runtime_trace["temporal"]
+        assert "temporal_adaptation" not in event
+
     def test_disabled_binding_feedback_rejected(self, tmp_path, monkeypatch):
         """Feedback submission on a disabled binding returns error."""
         import src.mcp_server as mcp_mod

@@ -19,7 +19,6 @@ import pytest
 from starlette.testclient import TestClient
 
 import src.mcp_server as mod
-from src.local_cli_backend import LocalCliTimeoutError
 from src.mcp_server import (
     _get_memory,
     courier_subscribe,
@@ -1348,6 +1347,83 @@ def test_memory_write_worker_promotes_chat_entry_into_extracted_memory(tmp_path)
     assert server._all_granular
 
 
+def test_memory_write_worker_content_only_extracted_facts_recall_not_blank(tmp_path, monkeypatch):
+    mod.data_dir = str(tmp_path)
+    mod.registry.clear()
+    writer_token = _principal_token("content-only-worker")
+
+    async def content_only_extract_session(**kwargs):
+        sn = kwargs.get("session_num", 1)
+        return (
+            "conv",
+            sn,
+            kwargs.get("session_date", "2024-06-01"),
+            [{
+                "content": "The neutral hook probe color is ultramarine.",
+                "kind": "preference",
+                "entities": ["neutral hook probe", "probe color"],
+                "tags": ["probe", "color"],
+                "session": sn,
+            }],
+            [],
+        )
+
+    monkeypatch.setattr("src.memory.extract_session", content_only_extract_session)
+
+    asyncio.run(memory_write(
+        key="write_content_only",
+        message_id="msg-content-only",
+        session_id="sess-content-only",
+        content="User: remember the neutral hook probe color.\nAssistant: noted",
+        content_family="chat",
+        timestamp_ms=1712000003000,
+        scope="agent-private",
+        token=writer_token,
+    ))
+    server = mod.registry["write_content_only"]
+
+    processed = asyncio.run(server.process_write_log_once())
+    assert processed == 1
+
+    status = asyncio.run(memory_write_status(
+        key="write_content_only",
+        message_id="msg-content-only",
+        token=writer_token,
+    ))
+    assert status["extraction_state"] == "complete"
+
+    assert server._all_granular
+    stored_fact = server._all_granular[0]
+    assert stored_fact.get("id")
+    assert stored_fact["fact"] == "The neutral hook probe color is ultramarine."
+
+    recall = asyncio.run(memory_recall(
+        key="write_content_only",
+        query="ultramarine neutral hook probe",
+        token_budget=2000,
+        token=writer_token,
+    ))
+
+    context = recall["context"]
+    assert "ultramarine" in context
+    retrieved_facts = context.split("RETRIEVED FACTS:", 1)[1].split("\n\n", 1)[0]
+    assert "The neutral hook probe color is ultramarine." in retrieved_facts
+    assert retrieved_facts.strip() != ""
+
+    runtime_trace = recall.get("runtime_trace") or {}
+    id_paths = [
+        ("selection", "selected_fact_ids"),
+        ("source_local_fact_sweep", "selected_fact_ids"),
+        ("packet", "source_local_fact_sweep", "selected_fact_ids"),
+    ]
+    for path in id_paths:
+        node = runtime_trace
+        for key in path:
+            node = node.get(key) if isinstance(node, dict) else None
+        if node is not None:
+            assert "" not in node
+
+
 def test_memory_write_rejects_unknown_content_family(tmp_path):
     mod.data_dir = str(tmp_path)
     mod.registry.clear()
@@ -1422,52 +1498,6 @@ def test_memory_write_enforces_strict_ingress_metadata_contract(tmp_path):
     assert "expected string or list of strings" in invalid_bool["error"]
     assert invalid_nested["code"] == "VALIDATION_ERROR"
     assert "expected string or list of strings" in invalid_nested["error"]
-def test_memory_store_local_cli_timeout_returns_explicit_error(tmp_path, monkeypatch):
-    mod.data_dir = str(tmp_path)
-    mod.registry.clear()
-    from src.librarian import extract_session as real_extract_session
-
-    def _fake_run_local_cli(prompt, cli_bin, cli_args_prefix):
-        raise LocalCliTimeoutError("local_cli subprocess timed out (timeout_secs=0.05)")
-
-    monkeypatch.setattr("src.memory.extract_session", real_extract_session)
-    monkeypatch.setattr("src.memory.run_local_cli", _fake_run_local_cli)
-    server = _get_memory("store_local_cli_timeout")
-    asyncio.run(server.set_config({
-        "schema_version": 1,
-        "embedding_model": "text-embedding-3-small",
-        "librarian_profile": "fast",
-        "profiles": {1: "fast"},
-        "profile_configs": {
-            "fast": {
-                "backend": "local_cli",
-                "model": "local/my-cli",
-                "cli_bin": "/abs/path/to/my-cli",
-                "cli_args_prefix": ["run"],
-                "context_window": 200000,
-                "max_output_tokens": 4096,
-                "temperature": 0,
-            }
-        },
-        "retrieval": {"search_family": "auto", "default_token_budget": 4000},
-    }))
-
-    writer_token = _principal_token("store-timeout-writer")
-    result = asyncio.run(memory_store(
-        key="store_local_cli_timeout",
-        content="Alice: The backup key is behind the picture frame.\nBob: Carol needs it tomorrow morning.",
-        session_num=1,
-        session_date="2024-06-01",
-        scope="agent-private",
-        token=writer_token,
-    ))
-
-    assert result["code"] == "LOCAL_CLI_TIMEOUT"
-    assert result["status"] == "extraction_failed"
-    assert result["facts_extracted"] == 0
-    assert server._raw_sessions[0]["status"] == "extraction_failed"
-
-
 def test_memory_write_and_status_support_concurrent_calls(tmp_path):
     mod.data_dir = str(tmp_path)
     mod.registry.clear()

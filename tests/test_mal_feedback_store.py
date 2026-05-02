@@ -109,6 +109,75 @@ def test_optional_fields_are_preserved(store, control):
     assert event["source_ids_hint"] == ["DOC-022"]
 
 
+def test_runtime_trace_temporal_payload_is_preserved(store, control):
+    control.set("proj", "default", enabled=True)
+    evidence_candidates = {
+        "trace_version": 1,
+        "operator_class": "direct_lookup",
+        "query_range": {
+            "start": "2026-02-03",
+            "end": "2026-02-03",
+            "source": "explicit",
+            "confidence": 0.95,
+        },
+        "candidate_count": 1,
+        "selected_episode_ids": ["SRC_e01"],
+        "candidates": [
+            {
+                "episode_id": "SRC_e01",
+                "fact_ids": ["f_001"],
+                "event_date": "2026-02-03",
+                "source_date": None,
+                "session_date": None,
+                "date_provenance": "event_date",
+                "date_relation": "inside_range",
+                "content_support": {
+                    "query_token_overlap": 3,
+                    "named_slot_overlap": 1,
+                    "answer_object_support": "present",
+                    "required_terms_missing": [],
+                },
+                "selection_status": "already_selected",
+                "reason": "selected_context_contains_candidate",
+            }
+        ],
+        "omitted_date_matching_episode_ids": [],
+        "warnings": [],
+    }
+    runtime_trace = {
+        "temporal": {
+            "trace_version": 1,
+            "path": "calendar_executor",
+            "leaf_decision": {
+                "source": "retrieval_leaf_prompt",
+                "execution_policy": "authoritative",
+            },
+            "executor": {
+                "used": True,
+                "type": "calendar",
+                "selected_episode_ids": ["EP-1"],
+            },
+            "evidence_candidates": evidence_candidates,
+        }
+    }
+
+    event_id = store.submit(
+        "proj",
+        "default",
+        _make_event(runtime_trace_ref="ask_temporal_001", runtime_trace=runtime_trace),
+    )
+    event = store.get_event("proj", "default", event_id)
+    queued = store.list_queued("proj", "default")
+
+    assert event["runtime_trace"]["temporal"]["trace_version"] == 1
+    assert event["runtime_trace"]["temporal"]["path"] == "calendar_executor"
+    assert event["runtime_trace"]["temporal"]["leaf_decision"]["source"] == "retrieval_leaf_prompt"
+    assert event["runtime_trace"]["temporal"]["executor"]["type"] == "calendar"
+    assert event["runtime_trace"]["temporal"]["evidence_candidates"] == evidence_candidates
+    assert queued[0]["runtime_trace"]["temporal"] == runtime_trace["temporal"]
+    assert queued[0]["runtime_trace"]["temporal"]["evidence_candidates"] == evidence_candidates
+
+
 # ── queued -> reserved -> consumed lifecycle (SPEC 3.1a) ──
 
 

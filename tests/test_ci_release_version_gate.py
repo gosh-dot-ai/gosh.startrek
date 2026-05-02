@@ -48,6 +48,22 @@ def _write_pyproject(repo: Path, version: str) -> None:
     )
 
 
+def _write_changelog(repo: Path, *versions: str) -> None:
+    lines = ["# Changelog", "", "## Unreleased", ""]
+    for version in versions:
+        lines.extend(
+            [
+                f"## v{version} - 2026-05-01",
+                "",
+                "### Changed",
+                "",
+                f"- Release notes for {version}.",
+                "",
+            ]
+        )
+    (repo / "CHANGELOG.md").write_text("\n".join(lines), encoding="utf-8")
+
+
 def _commit(repo: Path, message: str) -> str:
     _git(repo, "add", ".")
     _git(repo, "commit", "-qm", message)
@@ -61,6 +77,7 @@ def _repo_with_version(tmp_path: Path, version: str) -> Path:
     _git(repo, "config", "user.email", "tester@example.com")
     _git(repo, "config", "user.name", "Tester")
     _write_pyproject(repo, version)
+    _write_changelog(repo, version)
     _commit(repo, f"release {version}")
     return repo
 
@@ -95,10 +112,36 @@ def test_release_version_gate_accepts_bumped_tagged_version(tmp_path: Path) -> N
     repo = _repo_with_version(tmp_path, "0.3.5")
     before = _git(repo, "rev-parse", "HEAD")
     _write_pyproject(repo, "0.3.6")
+    _write_changelog(repo, "0.3.6", "0.3.5")
     head = _commit(repo, "release 0.3.6")
     _git(repo, "tag", "v0.3.6", head)
 
     release_version_gate.run_gate(_config(repo, before_sha=before))
+
+
+def test_release_version_gate_requires_changelog_entry_for_bumped_version(tmp_path: Path) -> None:
+    repo = _repo_with_version(tmp_path, "0.3.5")
+    before = _git(repo, "rev-parse", "HEAD")
+    _write_pyproject(repo, "0.3.6")
+    (repo / "README.md").write_text("release body\n", encoding="utf-8")
+    head = _commit(repo, "release 0.3.6 without changelog")
+    _git(repo, "tag", "v0.3.6", head)
+
+    with pytest.raises(release_version_gate.GateError, match="CHANGELOG.md must be updated"):
+        release_version_gate.run_gate(_config(repo, before_sha=before))
+
+
+def test_release_version_gate_requires_tagged_commit_changelog_entry(tmp_path: Path) -> None:
+    repo = _repo_with_version(tmp_path, "0.3.5")
+    before = _git(repo, "rev-parse", "HEAD")
+    _write_pyproject(repo, "0.3.6")
+    tagged = _commit(repo, "release 0.3.6 without changelog")
+    _git(repo, "tag", "v0.3.6", tagged)
+    _write_changelog(repo, "0.3.6", "0.3.5")
+    _commit(repo, "add changelog after tag")
+
+    with pytest.raises(release_version_gate.GateError, match=r"release entry for v0\.3\.6 .*v0\.3\.6"):
+        release_version_gate.run_gate(_config(repo, before_sha=before))
 
 
 def test_release_version_gate_skips_dev_pushes(tmp_path: Path) -> None:

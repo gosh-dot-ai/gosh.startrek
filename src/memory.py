@@ -21,7 +21,7 @@ import shutil
 from collections import Counter, defaultdict
 from collections.abc import Iterable
 from copy import deepcopy
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
@@ -129,7 +129,7 @@ from .librarian import (
     normalize_content_format,
     resolve_supersession,
 )
-from .local_cli_backend import LocalCliTimeoutError, render_local_cli_prompt, run_local_cli
+from .local_cli_backend import LocalCliTimeoutError
 from .mal.apply import current_gen_dir as _mal_current_gen_dir
 from .normalizer import acl_domain_key, dedup_domain_key, hamming_distance, normalize_text, simhash
 from .object_flags import normalize_object_flags_field, validate_object_flags
@@ -172,6 +172,7 @@ from .temporal import (
     latest_calendar_anchor,
     lookup_events_for_fact,
 )
+from .temporal_evidence_candidates import build_temporal_evidence_candidates_trace
 from .temporal_normalizer import normalize_temporal_index
 from .temporal_planner import (
     classify_temporal_query,
@@ -2599,6 +2600,7 @@ def _build_calendar_executor_packet(
             "matched": True,
             "anchor_resolved": True,
             "fallback": False,
+            "query_interval": hit.get("query"),
             "executor_episode_ids": selected_episode_ids,
             "pinned_episode_ids": selected_episode_ids,
             "matched_fact_ids": selected_fact_ids,
@@ -2606,6 +2608,7 @@ def _build_calendar_executor_packet(
     )
     packet = {
         "context": context,
+        "question": question,
         "retrieved_episode_ids": selected_episode_ids,
         "actual_injected_episode_ids": actual_injected_episode_ids,
         "fact_episode_ids": fact_episode_ids,
@@ -2637,6 +2640,317 @@ def _build_calendar_executor_packet(
         "temporal_trace": trace,
     }
     return packet, trace
+
+
+def _build_temporal_runtime_trace(
+    *,
+    packet: dict,
+    temporal_trace: dict | None,
+    episode_lookup: dict[str, dict],
+    resolved_facts: list[dict],
+    question: str | None = None,
+    temporal_index: dict | None = None,
+) -> dict | None:
+    """Normalize temporal diagnostics under ``runtime_trace.temporal``.
+
+    Telemetry only: this helper must not select, score, inject, render, or
+    suppress evidence. It only describes the temporal path that already ran.
+    """
+
+    temporal_trace = temporal_trace if isinstance(temporal_trace, dict) else {}
+    late_trace = packet.get("late_fusion_trace") or {}
+    query_plan = packet.get("query_operator_plan") or {}
+    temporal_leaf = query_plan.get("temporal_leaf") or {}
+    query_class = str(temporal_trace.get("query_class") or "")
+    late_mode = str(late_trace.get("mode") or "")
+    has_executor_rows = bool(
+        temporal_trace.get("executor_episode_ids")
+        or temporal_trace.get("pinned_episode_ids")
+        or temporal_trace.get("matched_fact_ids")
+        or temporal_trace.get("matched_event_ids")
+    )
+    temporal_meaningful = bool(
+        temporal_trace
+        or has_executor_rows
+        or str(temporal_leaf.get("source") or "none") not in {"", "none"}
+        or str(temporal_leaf.get("role") or "none") not in {"", "none"}
+        or temporal_leaf.get("spans")
+    )
+    if not temporal_meaningful:
+        return {
+            "trace_version": 1,
+            "path": "none",
+            "query_anchor": None,
+            "leaf_decision": {},
+            "executor": {
+                "used": False,
+                "type": None,
+                "selected_episode_ids": [],
+                "pinned_episode_ids": [],
+                "matched_fact_ids": [],
+                "matched_event_ids": [],
+                "skipped_reason": "non_temporal_query",
+            },
+            "episode_selection": {
+                "selected_episode_ids": list(packet.get("retrieved_episode_ids") or []),
+                "actual_injected_episode_ids": list(packet.get("actual_injected_episode_ids") or []),
+                "fact_pool_episode_ids": list(packet.get("fact_episode_ids") or []),
+                "selected_not_injected_episode_ids": [],
+                "injected_not_selected_episode_ids": [],
+            },
+            "lane": {
+                "active": False,
+                "policy": None,
+                "hard_pin_allowed": None,
+                "disabled_reason": "non_temporal_query",
+                "soft_expansion_episode_ids": [],
+                "rejected_candidate_count": 0,
+            },
+            "provenance": {
+                "enabled": False,
+                "bounded": True,
+                "candidate_episode_count": 0,
+                "omitted_date_matching_episode_count": 0,
+                "raw_relative_row_count": 0,
+                "date_provenance_by_episode": [],
+                "omitted_date_matching_candidates": [],
+                "raw_relative_rows": [],
+                "missing_reason": "non_temporal_query",
+            },
+            "coverage": {
+                "packet_trace_present": False,
+                "calendar_trace_present": False,
+                "ordinal_trace_present": False,
+                "missing_reason": "non_temporal_query",
+            },
+        }
+
+    if late_mode == "skipped_by_calendar_executor" or (
+        query_class == "calendar-answer" and has_executor_rows
+    ):
+        path = "calendar_executor"
+        executor_type = "calendar"
+    elif late_mode == "skipped_by_ordinal_executor" or (
+        query_class == "ordinal" and has_executor_rows
+    ):
+        path = "ordinal_executor"
+        executor_type = "ordinal"
+    elif temporal_meaningful:
+        path = "episode_late_fusion"
+        executor_type = None
+    else:
+        path = "none"
+        executor_type = None
+
+    def _as_list(value):
+        return list(value) if isinstance(value, list) else []
+
+    def _preview(text, limit: int = 180) -> str:
+        return re.sub(r"\s+", " ", str(text or "")).strip()[:limit]
+
+    def _raw_date_text(value) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if isinstance(value, date):
+            return value.isoformat()
+        text = str(value).strip()
+        return text or None
+
+    def _date_text(value) -> str | None:
+        """Return an ISO calendar date only for recognized full-date inputs.
+
+        Telemetry must fail closed here: arbitrary timestamp strings are kept
+        as raw values, not truncated into fake dates.
+        """
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value.date().isoformat()
+        if isinstance(value, date):
+            return value.isoformat()
+        text = str(value).strip()
+        if not text:
+            return None
+        iso_match = re.match(r"^(\d{4}-\d{2}-\d{2})(?:[T\s].*)?$", text)
+        if iso_match:
+            try:
+                return datetime.fromisoformat(iso_match.group(1)).date().isoformat()
+            except ValueError:
+                return None
+        month_name = r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+        has_full_month_date = (
+            re.search(r"\b\d{1,2}(?:st|nd|rd|th)?\s+" + month_name + r"\b.*\b\d{4}\b", text, re.I)
+            or re.search(month_name + r"\s+\d{1,2}(?:st|nd|rd|th)?(?:,)?\s+\d{4}\b", text, re.I)
+        )
+        if not has_full_month_date:
+            return None
+        try:
+            return date_parser.parse(text, fuzzy=False).date().isoformat()
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    selected_episode_ids = _as_list(packet.get("retrieved_episode_ids"))
+    actual_injected_episode_ids = _as_list(packet.get("actual_injected_episode_ids"))
+    fact_pool_episode_ids = _as_list(packet.get("fact_episode_ids"))
+    selected_set = set(selected_episode_ids)
+    injected_set = set(actual_injected_episode_ids)
+    fact_pool_set = set(fact_pool_episode_ids)
+    selection_scores = packet.get("selection_scores") or []
+    score_rank: dict[str, int] = {}
+    score_value: dict[str, float] = {}
+    if isinstance(selection_scores, list):
+        for idx, row in enumerate(selection_scores, start=1):
+            if not isinstance(row, dict):
+                continue
+            ep_id = str(row.get("episode_id") or "").strip()
+            if not ep_id:
+                continue
+            score_rank[ep_id] = idx
+            try:
+                score_value[ep_id] = float(row.get("score") or 0.0)
+            except (TypeError, ValueError):
+                score_value[ep_id] = 0.0
+    facts_by_episode = build_facts_by_episode(resolved_facts or [])
+    evidence_candidates = build_temporal_evidence_candidates_trace(
+        question=question or str(packet.get("question") or ""),
+        packet=packet,
+        episode_lookup=episode_lookup,
+        facts_by_episode=facts_by_episode,
+        temporal_index=temporal_index,
+        temporal_trace=temporal_trace,
+    )
+    candidate_episode_ids = list(
+        dict.fromkeys(
+            [
+                *selected_episode_ids,
+                *actual_injected_episode_ids,
+                *fact_pool_episode_ids,
+                *_as_list(temporal_trace.get("executor_episode_ids")),
+                *_as_list(temporal_trace.get("pinned_episode_ids")),
+            ]
+        )
+    )
+    date_rows: list[dict] = []
+    raw_relative_rows: list[dict] = []
+    relative_re = re.compile(
+        r"\b(today|tonight|tomorrow|yesterday|last night|last week|next week|this week|last month|next month|this month|morning|afternoon|evening|night)\b",
+        re.I,
+    )
+    for ep_id in candidate_episode_ids:
+        ep = episode_lookup.get(ep_id) or {}
+        facts = facts_by_episode.get(ep_id) or []
+        raw_text = str(ep.get("raw_text") or "")
+        fact_dates = []
+        evidence = []
+        for fact in facts[:6]:
+            metadata = fact.get("metadata") or {}
+            raw_event_date = metadata.get("event_date") or fact.get("event_date")
+            raw_source_date = metadata.get("source_date") or fact.get("source_date")
+            event_date = _date_text(raw_event_date)
+            source_date = _date_text(raw_source_date)
+            event_date_raw = _raw_date_text(raw_event_date)
+            source_date_raw = _raw_date_text(raw_source_date)
+            if event_date or source_date or event_date_raw or source_date_raw:
+                fact_dates.append({
+                    "fact_id": str(fact.get("id") or ""),
+                    "event_date": event_date,
+                    "event_date_raw": event_date_raw,
+                    "source_date": source_date,
+                    "source_date_raw": source_date_raw,
+                    "text_preview": _preview(fact.get("fact"), 180),
+                })
+            evidence.append({
+                "fact_id": str(fact.get("id") or ""),
+                "text_preview": _preview(fact.get("fact"), 180),
+            })
+        relative_terms = sorted({m.group(0).lower() for m in relative_re.finditer(raw_text)})
+        row = {
+            "episode_id": ep_id,
+            "selected": ep_id in selected_set,
+            "injected": ep_id in injected_set,
+            "fact_pool": ep_id in fact_pool_set,
+            "score_rank": score_rank.get(ep_id),
+            "selection_score": score_value.get(ep_id),
+            "source_type": str(ep.get("source_type") or ""),
+            "source_id": str(ep.get("source_id") or ""),
+            "source_date": _date_text(ep.get("source_date") or ep.get("timestamp")),
+            "source_date_raw": _raw_date_text(ep.get("source_date") or ep.get("timestamp")),
+            "session_date": _date_text(ep.get("session_date")),
+            "session_date_raw": _raw_date_text(ep.get("session_date")),
+            "fact_dates": fact_dates[:6],
+            "relative_terms": relative_terms[:8],
+            "evidence_count": len(evidence),
+            "evidence": evidence[:6],
+            "raw_preview": _preview(raw_text, 220),
+        }
+        date_rows.append(row)
+        if relative_terms:
+            raw_relative_rows.append(row)
+    date_rows.sort(key=lambda row: (0 if row["injected"] else 1, row["score_rank"] or 10**9, row["episode_id"]))
+    raw_relative_rows.sort(key=lambda row: (0 if row["injected"] else 1, row["score_rank"] or 10**9, row["episode_id"]))
+    executor_used = path in {"calendar_executor", "ordinal_executor"} and not bool(temporal_trace.get("fallback", True))
+    provenance_enabled = bool(date_rows)
+    calendar_trace_present = path == "calendar_executor" and has_executor_rows
+    ordinal_trace_present = path == "ordinal_executor" and has_executor_rows
+    return {
+        "trace_version": 1,
+        "path": path,
+        "query_anchor": None,
+        "leaf_decision": {
+            "source": temporal_leaf.get("source"),
+            "role": temporal_leaf.get("role"),
+            "spans": _as_list(temporal_leaf.get("spans")),
+            "query_class": temporal_leaf.get("query_class"),
+            "execution_policy": temporal_leaf.get("execution_policy"),
+            "confidence": temporal_leaf.get("confidence"),
+            "reason": temporal_leaf.get("reason"),
+            "safe_pinning_condition": temporal_leaf.get("safe_pinning_condition"),
+        },
+        "executor": {
+            "used": executor_used,
+            "type": executor_type,
+            "selected_episode_ids": _as_list(temporal_trace.get("executor_episode_ids")),
+            "pinned_episode_ids": _as_list(temporal_trace.get("pinned_episode_ids")),
+            "matched_fact_ids": _as_list(temporal_trace.get("matched_fact_ids")),
+            "matched_event_ids": _as_list(temporal_trace.get("matched_event_ids")),
+            "skipped_reason": None if executor_used else temporal_trace.get("fallback_reason"),
+        },
+        "episode_selection": {
+            "selected_episode_ids": selected_episode_ids,
+            "actual_injected_episode_ids": actual_injected_episode_ids,
+            "fact_pool_episode_ids": fact_pool_episode_ids,
+            "selected_not_injected_episode_ids": [ep_id for ep_id in selected_episode_ids if ep_id not in injected_set],
+            "injected_not_selected_episode_ids": [ep_id for ep_id in actual_injected_episode_ids if ep_id not in selected_set],
+        },
+        "lane": {
+            "active": False,
+            "policy": temporal_leaf.get("execution_policy"),
+            "hard_pin_allowed": None,
+            "disabled_reason": None,
+            "soft_expansion_episode_ids": [],
+            "rejected_candidate_count": 0,
+        },
+        "provenance": {
+            "enabled": provenance_enabled,
+            "bounded": True,
+            "candidate_episode_count": len(candidate_episode_ids),
+            "omitted_date_matching_episode_count": 0,
+            "raw_relative_row_count": len(raw_relative_rows),
+            "date_provenance_by_episode": date_rows[:32],
+            "omitted_date_matching_candidates": [],
+            "raw_relative_rows": raw_relative_rows[:16],
+            "missing_reason": None if provenance_enabled else "no_temporal_candidate_rows",
+        },
+        **({"evidence_candidates": evidence_candidates} if evidence_candidates else {}),
+        "coverage": {
+            "packet_trace_present": False,
+            "calendar_trace_present": calendar_trace_present,
+            "ordinal_trace_present": ordinal_trace_present,
+            "missing_reason": None if provenance_enabled else "no_temporal_candidate_rows",
+        },
+    }
 
 
 def build_episode_hybrid_context(
@@ -3174,6 +3488,7 @@ def build_episode_hybrid_context(
     )
     return {
         "context": context,
+        "question": question,
         "retrieved_episode_ids": selected_episode_ids,
         "actual_injected_episode_ids": actual_injected_episode_ids,
         "fact_episode_ids": fact_episode_ids,
@@ -3715,6 +4030,77 @@ def _normalize_fact_types(f: dict) -> None:
         f["tags"] = [v] if isinstance(v, str) and v else []
 
 
+def _non_empty_text(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip()
+
+
+def _non_empty_id_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _normalize_extracted_facts(facts: Any) -> list[dict]:
+    if isinstance(facts, dict):
+        rows: Iterable[Any] = [facts]
+    elif isinstance(facts, Iterable) and not isinstance(facts, (str, bytes)):
+        rows = facts
+    else:
+        rows = []
+
+    normalized: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        fact = dict(row)
+        fact_text = _non_empty_text(fact.get("fact"))
+        if not fact_text:
+            for alias in ("content", "text", "statement"):
+                alias_text = _non_empty_text(fact.get(alias))
+                if alias_text:
+                    fact["fact"] = alias_text
+                    fact_text = alias_text
+                    break
+        elif not isinstance(fact.get("fact"), str):
+            fact["fact"] = fact_text
+        if not fact_text:
+            continue
+        normalized.append(fact)
+
+    reserved_ids = {
+        row_id
+        for row_id in (_non_empty_id_text(row.get("id")) for row in normalized)
+        if row_id
+    }
+    seen_ids: set[str] = set()
+    next_local_id = 1
+
+    def _next_generated_id() -> str:
+        nonlocal next_local_id
+        while True:
+            candidate = f"f_{next_local_id:04d}"
+            next_local_id += 1
+            if candidate not in reserved_ids and candidate not in seen_ids:
+                return candidate
+
+    result: list[dict] = []
+    for fact in normalized:
+        fact_id = _non_empty_id_text(fact.get("id"))
+        if fact_id and fact_id not in seen_ids:
+            if fact.get("id") != fact_id:
+                fact["id"] = fact_id
+        else:
+            fact["id"] = _next_generated_id()
+            fact_id = fact["id"]
+        seen_ids.add(fact_id)
+        normalize_object_flags_field(fact)
+        _normalize_fact_types(fact)
+        result.append(fact)
+    return result
+
+
 def _validate_object_flags_field(obj: dict, *, label: str = "object") -> str | None:
     if not isinstance(obj, dict):
         return f"{label} must be a dict, got {type(obj).__name__}"
@@ -3786,7 +4172,7 @@ def _coerce_extract_session_result(result: Any) -> tuple[str, int, str, list[dic
     for link in tlinks_list:
         if isinstance(link, dict):
             normalize_object_flags_field(link)
-    return conv_id, sn, sdate, list(facts or []), tlinks_list, report
+    return conv_id, sn, sdate, _normalize_extracted_facts(facts), tlinks_list, report
 
 
 def _set_runtime_report_artifact(
@@ -5199,13 +5585,9 @@ class MemoryServer:
     ):
         profile_cfg = self._resolve_librarian_profile_config(model)
         if profile_cfg is not None and self._profile_backend(profile_cfg) == "local_cli":
-            return await self._run_local_cli_extract(
-                system=system,
-                user_msg=user_msg,
-                cli_bin=str(profile_cfg["cli_bin"]),
-                cli_args_prefix=list(profile_cfg["cli_args_prefix"]),
-                timeout_secs=profile_cfg.get("timeout_secs"),
-                sem=sem,
+            raise RuntimeError(
+                "local_cli profiles are agent-executed and cannot be used as memory "
+                "librarian/extraction profiles"
             )
         with self._runtime_secret_context(
             self._resolve_librarian_secret_ref(model),
@@ -7665,7 +8047,9 @@ class MemoryServer:
             metadata["dropped_layers"] = dropped_layers
             metadata["failure_reasons"] = failure_reasons
             if source_date:
-                fact.setdefault("event_date", source_date)
+                metadata["source_date_fallback"] = source_date
+                if not fact.get("event_date"):
+                    metadata.setdefault("event_date_provenance", "source_date_fallback")
             err = _validate_object_flags_field(fact)
             if err:
                 raise ValueError(f"Derived fact '{fact.get('id', '?')}': {err}")
@@ -7685,6 +8069,119 @@ class MemoryServer:
             meta["episode_source_id"] = episode_source_id
             if artifact_span_id:
                 meta["artifact_span_id"] = artifact_span_id
+
+    def _asserted_import_episode_for_raw_session(
+        self,
+        *,
+        raw_session: dict,
+        source_id: str,
+        episode_id: str,
+        session_date: str,
+    ) -> dict:
+        raw_text = str(
+            raw_session.get("content")
+            or raw_session.get("raw_text")
+            or raw_session.get("raw_original")
+            or "",
+        )
+        canonicalization_status = str(raw_session.get("canonicalization_status") or "noop")
+        source_lang = str(raw_session.get("source_lang") or "en")
+        translation_version = str(raw_session.get("translation_version") or "")
+        semantic_ready = bool(raw_session.get("semantic_ready", True))
+        episode = {
+            "episode_id": episode_id,
+            "source_type": "conversation",
+            "source_id": source_id,
+            "source_date": session_date,
+            "topic_key": f"session_{int(raw_session.get('session_num', 0))}",
+            "state_label": "session",
+            "currentness": "unknown",
+            "raw_text": raw_text,
+            "raw_original": str(raw_session.get("raw_original") or raw_text),
+            "canonical_en": str(raw_session.get("canonical_en") or raw_text),
+            "semantic_ready": semantic_ready,
+            "canonicalization_status": canonicalization_status,
+            "canonicalization_error": raw_session.get("canonicalization_error"),
+            "source_lang": source_lang,
+            "translation_version": translation_version,
+            "provenance": {"raw_span": [0, len(raw_text)]},
+            "session_num": raw_session.get("session_num"),
+            "projection_session_num": raw_session.get("projection_session_num"),
+            "raw_session_id": raw_session.get("raw_session_id"),
+            "message_id": raw_session.get("message_id"),
+            "stored_at": raw_session.get("stored_at"),
+            "agent_id": raw_session.get("agent_id"),
+            "swarm_id": raw_session.get("swarm_id"),
+            "scope": raw_session.get("scope"),
+            "owner_id": raw_session.get("owner_id"),
+            "read": list(raw_session.get("read") or []),
+            "write": list(raw_session.get("write") or []),
+            "artifact_id": raw_session.get("artifact_id"),
+            "version_id": raw_session.get("version_id"),
+            "status": str(raw_session.get("status") or "active"),
+        }
+        metadata = raw_session.get("metadata")
+        if isinstance(metadata, dict):
+            episode["metadata"] = dict(metadata)
+            role = str(metadata.get("role") or "").strip()
+            if role:
+                episode["role"] = role
+            turn_number = _coerce_positive_session_num(metadata.get("turn_number"))
+            if turn_number is not None:
+                episode["turn_number"] = turn_number
+        return episode
+
+    def _asserted_import_episode_bridge(
+        self,
+        *,
+        raw_sessions: list[dict],
+        facts: list[dict],
+        sdate_map: dict[int, str],
+    ) -> None:
+        """Bridge asserted raw sessions/facts into the episode runtime.
+
+        This stamps episode metadata and upserts conversation episode
+        documents. It intentionally never derives fact event_date from
+        source/session dates.
+        """
+        if not raw_sessions:
+            return
+
+        facts_by_session: dict[int, list[dict]] = defaultdict(list)
+        for fact in facts:
+            session_num = _coerce_positive_session_num(fact.get("session"))
+            if session_num is not None:
+                facts_by_session[session_num].append(fact)
+
+        episodes_by_source: dict[str, list[dict]] = defaultdict(list)
+        for raw_session in raw_sessions:
+            session_num = _coerce_positive_session_num(raw_session.get("session_num"))
+            if session_num is None:
+                continue
+            raw_source_id = str(raw_session.get("source_id") or "").strip()
+            resolved_source_id = raw_source_id or self.key
+            episode_id = str(raw_session.get("episode_id") or "").strip()
+            if not episode_id:
+                episode_id = f"{self._episode_source_key(resolved_source_id)}_e{session_num:04d}"
+            raw_session["episode_id"] = episode_id
+
+            session_facts = facts_by_session.get(session_num) or []
+            if session_facts:
+                self._stamp_episode_metadata(session_facts, episode_id, resolved_source_id)
+
+            session_date = sdate_map.get(session_num, str(raw_session.get("session_date") or ""))
+            episode = self._asserted_import_episode_for_raw_session(
+                raw_session=raw_session,
+                source_id=resolved_source_id,
+                episode_id=episode_id,
+                session_date=session_date,
+            )
+            episodes_by_source[resolved_source_id].append(episode)
+
+        for resolved_source_id, episodes in episodes_by_source.items():
+            doc_id = self._conversation_doc_id(resolved_source_id)
+            for episode in episodes:
+                self._append_or_replace_episode(doc_id, episode)
 
     @staticmethod
     def _align_fact_selectors(
@@ -8002,11 +8499,13 @@ class MemoryServer:
         packet: dict,
         episode_lookup: dict[str, dict],
         resolved_facts: list[dict],
+        question: str | None = None,
+        temporal_index: dict | None = None,
     ) -> dict:
         telemetry = get_runtime_tuning()["telemetry"]
         if not telemetry.get("include_runtime_trace", True):
             return {"runtime": "episode", "trace_disabled": True}
-        return {
+        trace = {
             "runtime": "episode",
             "scope": self._scope_trace(),
             "family_first_pass": packet.get("family_first_pass_trace", {
@@ -8051,6 +8550,17 @@ class MemoryServer:
             },
             "tuning": packet.get("tuning_snapshot", {}),
         }
+        temporal_runtime_trace = _build_temporal_runtime_trace(
+            packet=packet,
+            temporal_trace=packet.get("temporal_trace"),
+            episode_lookup=episode_lookup,
+            resolved_facts=resolved_facts,
+            question=question,
+            temporal_index=temporal_index,
+        )
+        if temporal_runtime_trace is not None:
+            trace["temporal"] = temporal_runtime_trace
+        return trace
 
     def _canonical_retrieved_items(self, facts: list[dict]) -> list[dict]:
         items: list[dict] = []
@@ -17201,7 +17711,18 @@ class MemoryServer:
                     rs["owner_id"] = _owner
                     rs["read"] = list(_read)
                     rs["write"] = list(_write)
+                    rs.setdefault("artifact_id", _art_id)
+                    rs.setdefault("version_id", _ver_id)
+                    rs.setdefault("status", "active")
                     self._raw_sessions.append(rs)
+
+            # -- STEP 9.5: Bridge asserted raw sessions into the episode runtime --
+            if raw_sessions:
+                self._asserted_import_episode_bridge(
+                    raw_sessions=raw_sessions,
+                    facts=facts,
+                    sdate_map=sdate_map,
+                )
 
             # -- STEP 10: Update _n_sessions --
             candidates = [self._n_sessions]
@@ -18246,6 +18767,8 @@ class MemoryServer:
                     packet=packet,
                     episode_lookup=_episode_lookup,
                     resolved_facts=resolved_facts,
+                    question=retrieval_query,
+                    temporal_index=self._temporal_index,
                 ),
             }
             if packet.get("container_graph_trace"):
@@ -18833,56 +19356,6 @@ class MemoryServer:
             return cfg
         return None
 
-    async def _run_local_cli_extract(
-        self,
-        *,
-        system: str,
-        user_msg: str,
-        cli_bin: str,
-        cli_args_prefix: list[str],
-        timeout_secs: float | None = None,
-        sem: asyncio.Semaphore | None = None,
-    ) -> dict | list:
-        prompt = render_local_cli_prompt(system, [{"role": "user", "content": user_msg}])
-
-        async def _run() -> str:
-            if timeout_secs is None:
-                return await asyncio.to_thread(
-                    run_local_cli,
-                    prompt,
-                    cli_bin,
-                    cli_args_prefix,
-                )
-            return await asyncio.to_thread(
-                run_local_cli,
-                prompt,
-                cli_bin,
-                cli_args_prefix,
-                timeout_secs,
-            )
-
-        if sem is not None:
-            async with sem:
-                text = await _run()
-        else:
-            text = await _run()
-        text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
-        if not text:
-            return {}
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            try:
-                return parse_json_response(text)
-            except Exception:
-                match = re.search(r'```(?:json)?\s*([\s\S]*?)```', text)
-                if match:
-                    try:
-                        return json.loads(match.group(1))
-                    except Exception:
-                        pass
-                return {}
-
     def _normalize_profile_levels(self, profiles: dict) -> dict[int, str]:
         """Normalize complexity→profile mapping to int keys."""
         normalized = {}
@@ -18965,67 +19438,52 @@ class MemoryServer:
             if backend == "local_cli":
                 allowed = {
                     "backend",
-                    "model",
-                    "cli_bin",
-                    "cli_args_prefix",
-                    "timeout_secs",
                     "context_window",
                     "max_output_tokens",
                     "max_output_tokens_summarize",
-                    "temperature",
-                    "pricing",
+                    "thinking_overhead",
                 }
                 unknown = set(normalized_cfg) - allowed
                 if unknown:
                     raise ValueError(
-                        f"profile '{name}': local_cli has unknown keys: {', '.join(sorted(unknown))}"
+                        f"profile '{name}': local_cli profiles only support backend "
+                        f"and memory budgeting fields; "
+                        f"unsupported keys: {', '.join(sorted(unknown))}"
                     )
-                model = normalized_cfg.get("model")
-                if not isinstance(model, str) or not model.strip():
-                    raise ValueError(f"profile '{name}': model must be a non-empty string")
-                cli_bin = normalized_cfg.get("cli_bin")
-                if not isinstance(cli_bin, str) or not cli_bin.strip():
-                    raise ValueError(f"profile '{name}': cli_bin must be a non-empty string")
-                cli_args_prefix = normalized_cfg.get("cli_args_prefix")
-                if (
-                    not isinstance(cli_args_prefix, list)
-                    or any(not isinstance(arg, str) for arg in cli_args_prefix)
-                ):
-                    raise ValueError(f"profile '{name}': cli_args_prefix must be list[str]")
-                timeout_secs = normalized_cfg.get("timeout_secs")
-                if timeout_secs is not None and (
-                    not isinstance(timeout_secs, (int, float))
-                    or float(timeout_secs) <= 0
-                ):
+                if legacy_input_cost is not None or legacy_output_cost is not None:
                     raise ValueError(
-                        f"profile '{name}': timeout_secs must be positive number when set"
+                        f"profile '{name}': local_cli profiles do not support pricing"
                     )
-                context_window = normalized_cfg.get("context_window")
-                if not isinstance(context_window, int) or context_window <= 0:
-                    raise ValueError(f"profile '{name}': context_window must be positive int")
-                max_output_tokens = normalized_cfg.get("max_output_tokens")
-                if not isinstance(max_output_tokens, int) or max_output_tokens <= 0:
-                    raise ValueError(f"profile '{name}': max_output_tokens must be positive int")
+                if "context_window" in normalized_cfg:
+                    value = normalized_cfg["context_window"]
+                    if not isinstance(value, int) or value <= 0:
+                        raise ValueError(
+                            f"profile '{name}': context_window must be positive int"
+                        )
+                if "max_output_tokens" in normalized_cfg:
+                    value = normalized_cfg["max_output_tokens"]
+                    if not isinstance(value, int) or value <= 0:
+                        raise ValueError(
+                            f"profile '{name}': max_output_tokens must be positive int"
+                        )
                 if "max_output_tokens_summarize" in normalized_cfg:
                     value = normalized_cfg["max_output_tokens_summarize"]
                     if not isinstance(value, int) or value <= 0:
                         raise ValueError(
                             f"profile '{name}': max_output_tokens_summarize must be positive int"
                         )
-                temperature = normalized_cfg.get("temperature")
-                if not isinstance(temperature, (int, float)):
-                    raise ValueError(f"profile '{name}': temperature must be numeric")
-                if (
-                    "pricing" in normalized_cfg
-                    or legacy_input_cost is not None
-                    or legacy_output_cost is not None
-                ):
-                    normalized_cfg["pricing"] = self._normalize_profile_pricing(
-                        name,
-                        normalized_cfg.get("pricing"),
-                        legacy_input_cost=legacy_input_cost,
-                        legacy_output_cost=legacy_output_cost,
-                    )
+                if "thinking_overhead" in normalized_cfg:
+                    value = normalized_cfg["thinking_overhead"]
+                    if (
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or not math.isfinite(float(value))
+                        or value < 0
+                        or value >= 1
+                    ):
+                        raise ValueError(
+                            f"profile '{name}': thinking_overhead must be numeric between 0 and 1"
+                        )
                 normalized_configs[name] = normalized_cfg
                 continue
             if backend != "api":
@@ -19136,6 +19594,12 @@ class MemoryServer:
                 raise ValueError(
                     f"profile '{name}' referenced by level {level} but not in profile_configs"
                 )
+        if (
+            normalized_librarian_profile
+            and self._profile_backend(normalized_profile_configs.get(normalized_librarian_profile, {}))
+            == "local_cli"
+        ):
+            raise ValueError("librarian_profile cannot reference a local_cli profile")
 
         retrieval = self._normalize_retrieval_config(config.get("retrieval"))
 
@@ -19249,9 +19713,6 @@ class MemoryServer:
                 "cfg": {"model": inference_model, **fallback_cfg},
                 "secret_ref": deepcopy(secret_ref),
                 "backend": "api",
-                "cli_bin": None,
-                "cli_args_prefix": [],
-                "timeout_secs": None,
             }
 
         if self._has_profiles() and recommended_profile:
@@ -19274,15 +19735,12 @@ class MemoryServer:
                         )
                     )
                 return {
-                    "model": cfg["model"],
+                    "model": "local_cli" if backend == "local_cli" else cfg["model"],
                     "profile_used": recommended_profile,
                     "profile_fallback": False,
                     "cfg": {**fallback_cfg, **cfg},
                     "secret_ref": deepcopy(secret_ref),
                     "backend": backend,
-                    "cli_bin": cfg.get("cli_bin"),
-                    "cli_args_prefix": deepcopy(cfg.get("cli_args_prefix") or []),
-                    "timeout_secs": cfg.get("timeout_secs"),
                 }
 
         if self._has_profiles():
@@ -19306,15 +19764,16 @@ class MemoryServer:
                         )
                     )
                 return {
-                    "model": fallback_cfg_resolved["model"],
+                    "model": (
+                        "local_cli"
+                        if backend == "local_cli"
+                        else fallback_cfg_resolved["model"]
+                    ),
                     "profile_used": fallback,
                     "profile_fallback": True,
                     "cfg": {**fallback_cfg, **fallback_cfg_resolved},
                     "secret_ref": deepcopy(secret_ref),
                     "backend": backend,
-                    "cli_bin": fallback_cfg_resolved.get("cli_bin"),
-                    "cli_args_prefix": deepcopy(fallback_cfg_resolved.get("cli_args_prefix") or []),
-                    "timeout_secs": fallback_cfg_resolved.get("timeout_secs"),
                 }
 
         return None
@@ -19654,9 +20113,6 @@ class MemoryServer:
         model = payload_target["model"]
         cfg = payload_target["cfg"]
         backend = payload_target.get("backend", "api")
-        cli_bin = payload_target.get("cli_bin")
-        cli_args_prefix = payload_target.get("cli_args_prefix") or []
-        cli_timeout_secs = payload_target.get("timeout_secs")
 
         terminal_render_candidate_available = bool(finalized.get("terminal_render_candidate"))
         final_use_tool = finalized.get("use_tool", False) if use_tool is None else use_tool
@@ -19697,9 +20153,6 @@ class MemoryServer:
                 speakers=speakers,
                 temperature=temperature,
                 backend=backend,
-                cli_bin=cli_bin,
-                cli_args_prefix=cli_args_prefix,
-                cli_timeout_secs=cli_timeout_secs,
             )
         except Exception as exc:
             trace = {
@@ -20798,9 +21251,6 @@ class MemoryServer:
         temperature: float,
         use_tool: bool,
         backend: str = "api",
-        cli_bin: str | None = None,
-        cli_args_prefix: list[str] | None = None,
-        cli_timeout_secs: float | None = None,
     ) -> tuple[dict, int]:
         if backend == "local_cli":
             if use_tool:
@@ -20811,9 +21261,6 @@ class MemoryServer:
                 "messages": messages,
                 "max_output_tokens": max_tokens,
                 "temperature": temperature,
-                "cli_bin": cli_bin,
-                "cli_args_prefix": list(cli_args_prefix or []),
-                "cli_timeout_secs": cli_timeout_secs,
             }, 0)
 
         provider = _provider_for_model(model)
@@ -20868,9 +21315,6 @@ class MemoryServer:
         speakers: str,
         temperature: float,
         backend: str,
-        cli_bin: str | None = None,
-        cli_args_prefix: list[str] | None = None,
-        cli_timeout_secs: float | None = None,
     ) -> tuple[dict, str, dict, dict]:
         working = deepcopy(context_packet)
         removed = {"tier4": 0, "tier3": 0, "tier2": 0}
@@ -20892,9 +21336,6 @@ class MemoryServer:
                 temperature=temperature,
                 use_tool=use_tool,
                 backend=backend,
-                cli_bin=cli_bin,
-                cli_args_prefix=cli_args_prefix,
-                cli_timeout_secs=cli_timeout_secs,
             )
             message_tokens_est = _estimate_tokens(payload.get("messages", []))
             total_input_est = message_tokens_est + tool_tokens_est
@@ -20963,9 +21404,6 @@ class MemoryServer:
         cfg = payload_target["cfg"]
         secret_ref = payload_target["secret_ref"]
         backend = payload_target.get("backend", "api")
-        cli_bin = payload_target.get("cli_bin")
-        cli_args_prefix = payload_target.get("cli_args_prefix") or []
-        cli_timeout_secs = payload_target.get("timeout_secs")
 
         terminal_render_candidate_available = bool(recall_result.get("terminal_render_candidate"))
         final_use_tool = recall_result.get("use_tool", False) if use_tool is None else use_tool
@@ -21011,9 +21449,6 @@ class MemoryServer:
             temperature=temperature,
             use_tool=final_use_tool,
             backend=backend,
-            cli_bin=cli_bin,
-            cli_args_prefix=cli_args_prefix,
-            cli_timeout_secs=cli_timeout_secs,
         )
         message_tokens_est = _estimate_tokens(payload.get("messages", []))
         evidence_trace = dict((recall_result.get("runtime_trace") or {}).get("evidence_context") or {})
@@ -21295,34 +21730,9 @@ class MemoryServer:
         if backend == "local_cli":
             if has_tools:
                 raise RuntimeError("local_cli backend does not support tool use")
-            messages = list(payload.get("messages") or [])
-            system = ""
-            prompt_messages = []
-            for message in messages:
-                role = str(message.get("role") or "")
-                content = str(message.get("content") or "")
-                if role == "system" and not system:
-                    system = content
-                else:
-                    prompt_messages.append({"role": role, "content": content})
-            prompt = render_local_cli_prompt(system, prompt_messages)
-            cli_timeout_secs = payload.get("cli_timeout_secs")
-            if cli_timeout_secs is None:
-                answer = await asyncio.to_thread(
-                    run_local_cli,
-                    prompt,
-                    str(payload.get("cli_bin") or ""),
-                    list(payload.get("cli_args_prefix") or []),
-                )
-            else:
-                answer = await asyncio.to_thread(
-                    run_local_cli,
-                    prompt,
-                    str(payload.get("cli_bin") or ""),
-                    list(payload.get("cli_args_prefix") or []),
-                    cli_timeout_secs,
-                )
-            return answer, False, []
+            raise RuntimeError(
+                "local_cli backend is agent-executed; use memory_plan_inference and gosh-agent"
+            )
 
         if not has_tools:
             messages = payload.get("messages", [])

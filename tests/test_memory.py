@@ -19,8 +19,12 @@ import pytest
 import src.memory as memory_mod
 from src.episode_features import extract_query_features
 from src.inference import get_inf_prompt, get_more_context
-from src.local_cli_backend import LocalCliTimeoutError
-from src.memory import MemoryServer, _augment_commonality_facts, build_hybrid_context
+from src.memory import (
+    MemoryServer,
+    _augment_commonality_facts,
+    _coerce_extract_session_result,
+    build_hybrid_context,
+)
 
 DIM = 3072
 
@@ -52,6 +56,66 @@ def _fake_extract_result(n_facts=3, **tag_overrides):
         facts.append(f)
     tlinks = [{"before": "f0", "after": "f1", "signal": "then"}]
     return ("test_conv", 1, "2024-06-01", facts, tlinks)
+
+
+def test_coerce_extract_session_result_normalizes_extracted_facts_aliases():
+    facts = [
+        {
+            "content": "A neutral probe color is ultramarine.",
+            "kind": "preference",
+            "entities": "probe",
+            "tags": "color",
+        },
+        {"text": "A neutral probe shape is triangle.", "kind": ""},
+        {"statement": "A neutral probe size is compact."},
+        {"fact": "A canonical row stays unchanged.", "id": "existing_id"},
+        {"fact": "A generated-id collision row stays unchanged.", "id": "f_0001"},
+        {"content": "   "},
+        "not-a-dict",
+    ]
+
+    _conv_id, _sn, _sdate, normalized, _tlinks, _report = _coerce_extract_session_result(
+        ("test_conv", 1, "2024-06-01", facts, [])
+    )
+
+    assert [row["fact"] for row in normalized] == [
+        "A neutral probe color is ultramarine.",
+        "A neutral probe shape is triangle.",
+        "A neutral probe size is compact.",
+        "A canonical row stays unchanged.",
+        "A generated-id collision row stays unchanged.",
+    ]
+    assert normalized[0]["content"] == "A neutral probe color is ultramarine."
+    assert normalized[0]["kind"] == "preference"
+    assert normalized[0]["entities"] == ["probe"]
+    assert normalized[0]["tags"] == ["color"]
+    assert "kind" not in normalized[1]
+    assert normalized[3]["id"] == "existing_id"
+    assert normalized[4]["id"] == "f_0001"
+    generated_ids = [row["id"] for row in normalized[:3]]
+    assert all(generated_ids)
+    assert len({row["id"] for row in normalized}) == len(normalized)
+
+
+def test_coerce_extract_session_result_drops_non_string_fact_text_aliases():
+    facts = [
+        {"content": []},
+        {"content": {"x": "y"}},
+        {"text": ["triangle"]},
+        {"statement": {"shape": "compact"}},
+        {"fact": []},
+        {"fact": {"x": "y"}},
+        {"fact": 17},
+        {"content": "A valid string alias survives."},
+    ]
+
+    _conv_id, _sn, _sdate, normalized, _tlinks, _report = _coerce_extract_session_result(
+        ("test_conv", 1, "2024-06-01", facts, [])
+    )
+
+    assert [row["fact"] for row in normalized] == ["A valid string alias survives."]
+    assert "[]" not in normalized[0]["fact"]
+    assert "{'x': 'y'}" not in normalized[0]["fact"]
 
 
 async def _store(ms: MemoryServer, *args, **kwargs):
@@ -3952,6 +4016,110 @@ def test_recall_returns_context(tmp_path, monkeypatch):
     assert len(result["context"]) > 0
 
 
+@pytest.mark.asyncio
+async def test_recall_attaches_temporal_evidence_candidates_without_context_mutation(tmp_path, monkeypatch):
+    ms = MemoryServer(str(tmp_path), "temporal_candidate_trace", extract_model=None)
+    source_id = "trace-source"
+    answer_ep = "trace-source_e01"
+    weak_ep = "trace-source_e02"
+    ms._episode_corpus = {
+        "documents": [{
+            "doc_id": f"conversation:{source_id}",
+            "episodes": [
+                {
+                    "episode_id": answer_ep,
+                    "source_id": source_id,
+                    "source_type": "conversation",
+                    "source_date": "2026-02-03",
+                    "topic_key": "auth service file maintenance",
+                    "state_label": "session",
+                    "currentness": "current",
+                    "raw_text": "The auth service modified login.py on 2026-02-03.",
+                },
+                {
+                    "episode_id": weak_ep,
+                    "source_id": source_id,
+                    "source_type": "conversation",
+                    "source_date": "2026-02-03",
+                    "topic_key": "general planning",
+                    "state_label": "session",
+                    "currentness": "current",
+                    "raw_text": "The team held a planning meeting on 2026-02-03.",
+                },
+            ],
+        }]
+    }
+    facts = [
+        {
+            "id": "fact_login",
+            "fact": "auth service modified login.py on 2026-02-03.",
+            "kind": "fact",
+            "source_id": source_id,
+            "metadata": {"episode_id": answer_ep, "episode_source_id": source_id, "event_date": "2026-02-03"},
+        },
+        {
+            "id": "fact_meeting",
+            "fact": "The team held a planning meeting on 2026-02-03.",
+            "kind": "fact",
+            "source_id": source_id,
+            "metadata": {"episode_id": weak_ep, "episode_source_id": source_id, "event_date": "2026-02-03"},
+        },
+    ]
+    ms._all_granular = facts
+    ms._all_cons = []
+    ms._all_cross = []
+    ms._source_records = {source_id: {"family": "conversation"}}
+    ms._data_dict = {
+        "atomic_embs": np.array([[1.0, 0.0], [0.0, 1.0]], dtype=float),
+        "cons_embs": np.zeros((0, 2), dtype=float),
+        "cross_embs": np.zeros((0, 2), dtype=float),
+        "fact_lookup": {fact["id"]: fact for fact in facts},
+    }
+    ms._fact_lookup = dict(ms._data_dict["fact_lookup"])
+    ms._temporal_index = {
+        "events": {
+            "evt_login": {
+                "event_id": "evt_login",
+                "time_start": "2026-02-03",
+                "time_end": "2026-02-03",
+                "support_fact_ids": ["fact_login"],
+                "payload": {"episode_id": answer_ep},
+            },
+            "evt_meeting": {
+                "event_id": "evt_meeting",
+                "time_start": "2026-02-03",
+                "time_end": "2026-02-03",
+                "support_fact_ids": ["fact_meeting"],
+                "payload": {"episode_id": weak_ep},
+            },
+        },
+        "timelines": {},
+        "anchors": {},
+        "calendar_sorted_event_ids": ["evt_login", "evt_meeting"],
+    }
+    ms._temporal_index_dirty = False
+
+    async def _fake_embed_query(_text, model=None, provider=None):
+        return np.array([1.0, 0.0], dtype=float)
+
+    monkeypatch.setattr("src.memory.embed_query", _fake_embed_query)
+
+    result = await ms.recall(
+        "Which file did auth service modify on 2026-02-03?",
+        search_family="conversation",
+        query_type="lookup",
+    )
+
+    assert "evidence_candidates" not in result["context"]
+    temporal = result["runtime_trace"]["temporal"]
+    candidates = temporal["evidence_candidates"]
+    assert candidates["trace_version"] == 1
+    assert candidates["operator_class"] == "direct_lookup"
+    assert candidates["query_range"]["start"] == "2026-02-03"
+    assert answer_ep in candidates["selected_episode_ids"]
+    assert {row["episode_id"] for row in candidates["candidates"]} >= {answer_ep, weak_ep}
+
+
 def test_cache_survives_restart(tmp_path, monkeypatch):
     """MemoryServer reloads persisted cache from disk on init."""
     _patch_all(monkeypatch)
@@ -5399,204 +5567,192 @@ async def test_invalid_fact_flags_schema_is_rejected_deterministically(tmp_path,
 
 
 @pytest.mark.asyncio
-async def test_set_config_accepts_local_cli_profile_config(tmp_path):
-    ms = MemoryServer(str(tmp_path), "local_cli_config_valid")
+async def test_set_config_accepts_minimal_agent_executed_local_cli_profile(tmp_path):
+    ms = MemoryServer(str(tmp_path), "local_cli_config_minimal")
 
     await ms.set_config({
         "schema_version": 1,
         "embedding_model": "text-embedding-3-small",
-        "librarian_profile": "fast",
+        "librarian_profile": "extract",
         "profiles": {1: "fast"},
         "profile_configs": {
-            "fast": {
-                "backend": "local_cli",
-                "model": "local/my-cli",
-                "cli_bin": "/abs/path/to/my-cli",
-                "cli_args_prefix": ["run"],
-                "context_window": 200000,
-                "max_output_tokens": 4096,
-                "temperature": 0,
-            }
+            "extract": {
+                "model": "gpt-4o-mini",
+                "secret_ref": {"name": "openai", "scope": "system-wide"},
+            },
+            "fast": {"backend": "local_cli"},
         },
+        "embedding_secret_ref": {"name": "openai", "scope": "system-wide"},
+        "inference_secret_ref": {"name": "openai", "scope": "system-wide"},
         "retrieval": {"search_family": "auto", "default_token_budget": 4000},
     })
 
-    assert ms.get_config()["profile_configs"]["fast"]["backend"] == "local_cli"
+    assert ms.get_config()["profile_configs"]["fast"] == {"backend": "local_cli"}
 
 
 @pytest.mark.asyncio
-async def test_set_config_rejects_local_cli_profile_without_cli_bin(tmp_path):
-    ms = MemoryServer(str(tmp_path), "local_cli_config_invalid")
+async def test_set_config_accepts_local_cli_memory_budget_fields(tmp_path):
+    ms = MemoryServer(str(tmp_path), "local_cli_config_budget")
 
-    with pytest.raises(ValueError, match="cli_bin"):
+    await ms.set_config({
+        "schema_version": 1,
+        "embedding_model": "text-embedding-3-small",
+        "librarian_profile": "extract",
+        "profiles": {1: "fast"},
+        "profile_configs": {
+            "extract": {
+                "model": "gpt-4o-mini",
+                "secret_ref": {"name": "openai", "scope": "system-wide"},
+            },
+            "fast": {
+                "backend": "local_cli",
+                "context_window": 128000,
+                "max_output_tokens": 2048,
+                "max_output_tokens_summarize": 4096,
+                "thinking_overhead": 0.2,
+            },
+        },
+        "embedding_secret_ref": {"name": "openai", "scope": "system-wide"},
+        "inference_secret_ref": {"name": "openai", "scope": "system-wide"},
+        "retrieval": {"search_family": "auto", "default_token_budget": 4000},
+    })
+
+    assert ms.get_config()["profile_configs"]["fast"] == {
+        "backend": "local_cli",
+        "context_window": 128000,
+        "max_output_tokens": 2048,
+        "max_output_tokens_summarize": 4096,
+        "thinking_overhead": 0.2,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "unsupported_key, unsupported_value",
+    [
+        ("model", "local/my-cli"),
+        ("provider", "claude"),
+        ("cli_bin", "/abs/path/to/my-cli"),
+        ("cli_args_prefix", ["run"]),
+        ("temperature", 0),
+        ("secret_ref", {"name": "openai", "scope": "system-wide"}),
+        ("pricing", {"input_per_1k": 0.0, "output_per_1k": 0.0}),
+    ],
+)
+async def test_set_config_rejects_local_cli_host_local_or_model_keys(
+    tmp_path, unsupported_key, unsupported_value
+):
+    ms = MemoryServer(str(tmp_path), f"local_cli_config_rejects_{unsupported_key}")
+
+    profile = {"backend": "local_cli", unsupported_key: unsupported_value}
+    with pytest.raises(
+        ValueError,
+        match="local_cli profiles only support backend and memory budgeting fields",
+    ):
         await ms.set_config({
             "schema_version": 1,
             "embedding_model": "text-embedding-3-small",
-            "librarian_profile": "fast",
+            "librarian_profile": "extract",
             "profiles": {1: "fast"},
             "profile_configs": {
-                "fast": {
-                    "backend": "local_cli",
-                    "model": "local/my-cli",
-                    "cli_args_prefix": ["run"],
-                    "context_window": 200000,
-                    "max_output_tokens": 4096,
-                    "temperature": 0,
-                }
+                "extract": {
+                    "model": "gpt-4o-mini",
+                    "secret_ref": {"name": "openai", "scope": "system-wide"},
+                },
+                "fast": profile,
             },
+            "embedding_secret_ref": {"name": "openai", "scope": "system-wide"},
+            "inference_secret_ref": {"name": "openai", "scope": "system-wide"},
             "retrieval": {"search_family": "auto", "default_token_budget": 4000},
         })
 
 
 @pytest.mark.asyncio
-async def test_store_uses_local_cli_extraction_without_secret_ref(tmp_path, monkeypatch):
-    monkeypatch.setattr("src.memory.resolve_supersession", lambda facts, lookup: None)
-    captured = {}
+@pytest.mark.parametrize(
+    "field, value, message",
+    [
+        ("context_window", 0, "context_window must be positive int"),
+        ("max_output_tokens", 0, "max_output_tokens must be positive int"),
+        (
+            "max_output_tokens_summarize",
+            0,
+            "max_output_tokens_summarize must be positive int",
+        ),
+        ("thinking_overhead", 1, "thinking_overhead must be numeric between 0 and 1"),
+    ],
+)
+async def test_set_config_rejects_invalid_local_cli_memory_budget_fields(
+    tmp_path, field, value, message
+):
+    ms = MemoryServer(str(tmp_path), f"local_cli_config_invalid_budget_{field}")
 
-    def _fake_run_local_cli(prompt, cli_bin, cli_args_prefix):
-        captured["prompt"] = prompt
-        captured["cli_bin"] = cli_bin
-        captured["cli_args_prefix"] = cli_args_prefix
-        return json.dumps({
-            "facts": [{
-                "id": "f_01",
-                "fact": "CLI extracted fact",
-                "kind": "fact",
-                "entities": [],
-                "tags": [],
-            }],
-            "temporal_links": [],
+    with pytest.raises(ValueError, match=message):
+        await ms.set_config({
+            "schema_version": 1,
+            "embedding_model": "text-embedding-3-small",
+            "librarian_profile": "extract",
+            "profiles": {1: "fast"},
+            "profile_configs": {
+                "extract": {
+                    "model": "gpt-4o-mini",
+                    "secret_ref": {"name": "openai", "scope": "system-wide"},
+                },
+                "fast": {"backend": "local_cli", field: value},
+            },
+            "embedding_secret_ref": {"name": "openai", "scope": "system-wide"},
+            "inference_secret_ref": {"name": "openai", "scope": "system-wide"},
+            "retrieval": {"search_family": "auto", "default_token_budget": 4000},
         })
 
-    monkeypatch.setattr("src.memory.run_local_cli", _fake_run_local_cli)
-    ms = MemoryServer(str(tmp_path), "local_cli_extract")
-    await ms.set_config({
-        "schema_version": 1,
-        "embedding_model": "text-embedding-3-small",
-        "librarian_profile": "fast",
-        "profiles": {1: "fast"},
-        "profile_configs": {
-            "fast": {
-                "backend": "local_cli",
-                "model": "local/my-cli",
-                "cli_bin": "/abs/path/to/my-cli",
-                "cli_args_prefix": ["run"],
-                "context_window": 200000,
-                "max_output_tokens": 4096,
-                "temperature": 0,
-            }
-        },
-        "retrieval": {"search_family": "auto", "default_token_budget": 4000},
-    })
 
-    result = await _store(ms, "Narrative content for local CLI extraction.", session_num=1, session_date="2024-06-01")
+@pytest.mark.asyncio
+async def test_set_config_rejects_local_cli_librarian_profile(tmp_path):
+    ms = MemoryServer(str(tmp_path), "local_cli_librarian_invalid")
 
-    assert result["status"] == "ok"
-    assert result["facts_extracted"] >= 1
-    assert ms._all_granular[0]["fact"] == "CLI extracted fact"
-    assert captured["cli_bin"] == "/abs/path/to/my-cli"
-    assert captured["cli_args_prefix"] == ["run"]
-    assert captured["prompt"].startswith("SYSTEM:\n")
+    with pytest.raises(ValueError, match="librarian_profile cannot reference a local_cli profile"):
+        await ms.set_config({
+            "schema_version": 1,
+            "embedding_model": "text-embedding-3-small",
+            "librarian_profile": "fast",
+            "profiles": {1: "fast"},
+            "profile_configs": {"fast": {"backend": "local_cli"}},
+            "embedding_secret_ref": {"name": "openai", "scope": "system-wide"},
+            "inference_secret_ref": {"name": "openai", "scope": "system-wide"},
+            "retrieval": {"search_family": "auto", "default_token_budget": 4000},
+        })
 
 
 @pytest.mark.asyncio
-async def test_store_local_cli_timeout_returns_explicit_failure_without_hanging(tmp_path, monkeypatch):
-    monkeypatch.setattr("src.memory.resolve_supersession", lambda facts, lookup: None)
-
-    def _fake_run_local_cli(prompt, cli_bin, cli_args_prefix):
-        raise LocalCliTimeoutError("local_cli subprocess timed out (timeout_secs=0.05)")
-
-    monkeypatch.setattr("src.memory.run_local_cli", _fake_run_local_cli)
-    ms = MemoryServer(str(tmp_path), "local_cli_extract_timeout")
+async def test_memory_ask_rejects_agent_executed_local_cli_profile(tmp_path):
+    ms = MemoryServer(str(tmp_path), "local_cli_ask_invalid")
     await ms.set_config({
         "schema_version": 1,
         "embedding_model": "text-embedding-3-small",
-        "librarian_profile": "fast",
+        "librarian_profile": "extract",
         "profiles": {1: "fast"},
         "profile_configs": {
-            "fast": {
-                "backend": "local_cli",
-                "model": "local/my-cli",
-                "cli_bin": "/abs/path/to/my-cli",
-                "cli_args_prefix": ["run"],
-                "context_window": 200000,
-                "max_output_tokens": 4096,
-                "temperature": 0,
-            }
+            "extract": {
+                "model": "gpt-4o-mini",
+                "secret_ref": {"name": "openai", "scope": "system-wide"},
+            },
+            "fast": {"backend": "local_cli"},
         },
+        "embedding_secret_ref": {"name": "openai", "scope": "system-wide"},
+        "inference_secret_ref": {"name": "openai", "scope": "system-wide"},
         "retrieval": {"search_family": "auto", "default_token_budget": 4000},
     })
+    async def _fake_recall(*args, **kwargs):
+        return {
+            "context": "Evidence.",
+            "retrieved": [],
+            "recommended_profile": "fast",
+            "query_type": "default",
+        }
 
-    mrcr_style_content = (
-        "Alice: I left the keys in the red bowl by the door.\n"
-        "Bob: Right, and the spare is taped under the kitchen table.\n"
-        "Alice: Also remember that Carol borrowed the blue umbrella yesterday.\n"
-        "Bob: I wrote that on the whiteboard next to the grocery list.\n"
-        "Alice: Good, because tomorrow Dan needs the umbrella for the train station pickup."
-    )
+    ms.recall = _fake_recall
 
-    result = await asyncio.wait_for(
-        _store(ms, mrcr_style_content, session_num=1, session_date="2024-06-01"),
-        timeout=1.0,
-    )
-
-    assert result["code"] == "LOCAL_CLI_TIMEOUT"
-    assert result["status"] == "extraction_failed"
-    assert result["facts_extracted"] == 0
-    assert "timed out" in result["error"]
-    assert ms._all_granular == []
-    assert ms._raw_sessions[0]["status"] == "extraction_failed"
-    assert ms._raw_sessions[0]["extraction_error_code"] == "LOCAL_CLI_TIMEOUT"
-
-
-@pytest.mark.asyncio
-async def test_write_log_local_cli_timeout_does_not_mark_complete(tmp_path, monkeypatch):
-    monkeypatch.setattr("src.memory.resolve_supersession", lambda facts, lookup: None)
-
-    def _fake_run_local_cli(prompt, cli_bin, cli_args_prefix):
-        raise LocalCliTimeoutError("local_cli subprocess timed out (timeout_secs=0.05)")
-
-    monkeypatch.setattr("src.memory.run_local_cli", _fake_run_local_cli)
-    ms = MemoryServer(str(tmp_path), "local_cli_write_timeout")
-    await ms.set_config({
-        "schema_version": 1,
-        "embedding_model": "text-embedding-3-small",
-        "librarian_profile": "fast",
-        "profiles": {1: "fast"},
-        "profile_configs": {
-            "fast": {
-                "backend": "local_cli",
-                "model": "local/my-cli",
-                "cli_bin": "/abs/path/to/my-cli",
-                "cli_args_prefix": ["run"],
-                "context_window": 200000,
-                "max_output_tokens": 4096,
-                "temperature": 0,
-            }
-        },
-        "retrieval": {"search_family": "auto", "default_token_budget": 4000},
-    })
-
-    receipt = await _write(
-        ms,
-        message_id="local-cli-timeout-msg",
-        session_id="sess-1",
-        content="Alice: The backup key is behind the picture frame.\nBob: Carol needs it tomorrow morning.",
-        content_family="chat",
-        timestamp_ms=1712000000000,
-    )
-    assert receipt["extraction_state"] == "pending"
-
-    monkeypatch.setattr(ms, "_should_retry_write_entry", lambda entry, now_ms: True)
-
-    for _ in range(3):
-        processed = await ms.process_write_log_once(batch_size=1)
-        assert processed == 0
-
-    status = ms.write_status("local-cli-timeout-msg")
-    assert status["extraction_state"] == "failed"
-    assert ms._all_granular == []
-    assert any(rs.get("status") == "extraction_failed" for rs in ms._raw_sessions)
+    with pytest.raises(RuntimeError, match="local_cli backend is agent-executed"):
+        await ms.ask("What happened?")
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -5743,3 +5899,127 @@ def test_grounded_gate_preserves_explicit_not_mentioned(tmp_path):
     answer = "Not mentioned. The retrieved facts do not specify Mary's role."
     out = ms._normalize_grounded_answer("What is Mary's role?", answer, recall)
     assert out == "Not mentioned in the provided context."
+
+
+@pytest.mark.asyncio
+async def test_source_date_fallback_does_not_populate_event_date(tmp_path, monkeypatch):
+    ms = MemoryServer(str(tmp_path), "src_agg_fallback_provenance")
+    source_id = "doc:src-1"
+    doc_id = ms._document_doc_id(source_id)
+    ms._episode_corpus = {
+        "documents": [
+            {
+                "doc_id": doc_id,
+                "episodes": [
+                    {
+                        "episode_id": "ep-1",
+                        "source_id": source_id,
+                        "source_date": "2026-04-01",
+                        "raw_text": "Neutral planning note.",
+                        "provenance": {"raw_span": [0, 22]},
+                    }
+                ],
+            }
+        ]
+    }
+
+    async def _mock_extract(**_kwargs):
+        return {
+            "derived_facts": [
+                {
+                    "id": "derived-no-event",
+                    "fact": "Quarterly planning is in progress.",
+                    "kind": "fact",
+                },
+                {
+                    "id": "derived-with-event",
+                    "fact": "Project Delta shipped on 2026-03-10.",
+                    "kind": "fact",
+                    "event_date": "2026-03-10",
+                },
+            ],
+            "validation": {
+                "aggregation_status": "accepted",
+                "accepted_layers": ["L1"],
+                "dropped_layers": [],
+                "failure_reasons": [],
+            },
+            "source_aggregation_report": {"producer": "test"},
+        }
+
+    monkeypatch.setattr("src.memory.extract_source_aggregation", _mock_extract)
+
+    derived = await ms._extract_source_aggregation_facts(
+        source_id=source_id,
+        source_kind="document",
+        source_facts=[],
+        source_date="2026-04-01",
+        model="local/test",
+        call_extract_fn=lambda *args, **kwargs: {},
+    )
+
+    by_id = {fact["id"]: fact for fact in derived}
+    no_event = by_id["derived-no-event"]
+    assert no_event.get("event_date") in (None, "")
+    assert no_event["metadata"]["source_date_fallback"] == "2026-04-01"
+    assert no_event["metadata"]["event_date_provenance"] == "source_date_fallback"
+
+    with_event = by_id["derived-with-event"]
+    assert with_event["event_date"] == "2026-03-10"
+    assert with_event["metadata"]["source_date_fallback"] == "2026-04-01"
+    assert "event_date_provenance" not in with_event["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_source_date_fallback_absent_when_source_has_no_date(tmp_path, monkeypatch):
+    ms = MemoryServer(str(tmp_path), "src_agg_no_source_date")
+    source_id = "doc:src-2"
+    doc_id = ms._document_doc_id(source_id)
+    ms._episode_corpus = {
+        "documents": [
+            {
+                "doc_id": doc_id,
+                "episodes": [
+                    {
+                        "episode_id": "ep-2",
+                        "source_id": source_id,
+                        "raw_text": "Standalone snippet.",
+                        "provenance": {"raw_span": [0, 19]},
+                    }
+                ],
+            }
+        ]
+    }
+
+    async def _mock_extract(**_kwargs):
+        return {
+            "derived_facts": [
+                {
+                    "id": "derived-bare",
+                    "fact": "Some claim.",
+                    "kind": "fact",
+                }
+            ],
+            "validation": {
+                "aggregation_status": "accepted",
+                "accepted_layers": [],
+                "dropped_layers": [],
+                "failure_reasons": [],
+            },
+        }
+
+    monkeypatch.setattr("src.memory.extract_source_aggregation", _mock_extract)
+
+    derived = await ms._extract_source_aggregation_facts(
+        source_id=source_id,
+        source_kind="document",
+        source_facts=[],
+        source_date="",
+        model="local/test",
+        call_extract_fn=lambda *args, **kwargs: {},
+    )
+
+    fact = derived[0]
+    assert fact.get("event_date") in (None, "")
+    assert "source_date_fallback" not in fact["metadata"]
+    assert "event_date_provenance" not in fact["metadata"]
